@@ -8,8 +8,11 @@
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { join } from "node:path";
 import { AgentStore } from "./store.ts";
 import { SwarmService } from "./swarm.ts";
+import { SqliteLeaseStore } from "./leases.ts";
+import { Workspace } from "./workspace.ts";
 import { recoverInterrupted } from "./recovery.ts";
 import { createLogger } from "./logger.ts";
 
@@ -32,7 +35,13 @@ async function readBody(req: IncomingMessage): Promise<string> {
 
 async function main(): Promise<number> {
 	const store = new AgentStore(DB_PATH);
-	const service = new SwarmService({ store });
+	// Cross-process capacity gate: several worker processes sharing one
+	// database cannot overspend an account's concurrency.
+	const leases = new SqliteLeaseStore(store.database);
+	// Sandbox root for workspace tools (read/write/list/run_command).
+	const workspace = new Workspace({ root: process.env.PI_SWARM_WORKSPACE ?? join(process.cwd(), ".pi-swarm-workspace") });
+	await workspace.ensure();
+	const service = new SwarmService({ store, workspace, leases });
 
 	// Recover agents from a previous run: interrupted agents are failed with
 	// their durable transcript preserved; uncertain tool calls are reported
@@ -56,6 +65,44 @@ async function main(): Promise<number> {
 				const body = JSON.parse(await readBody(req)) as { spec: Record<string, unknown>; idempotencyKey?: string };
 				const result = service.spawnAgent({ spec: body.spec as never, idempotencyKey: body.idempotencyKey });
 				sendJson(res, result.duplicate ? 200 : 201, result);
+				return;
+			}
+			const eventsMatch = /^\/v1\/agents\/([^/]+)\/events$/.exec(url.pathname);
+			if (req.method === "GET" && eventsMatch?.[1]) {
+				const agentId = decodeURIComponent(eventsMatch[1]);
+				// Replay history (so a late consumer sees the whole run), then
+				// stream live. `?since=<seq>` resumes after a reconnect.
+				const since = Number.parseInt(url.searchParams.get("since") ?? "0", 10) || 0;
+				res.writeHead(200, {
+					"Content-Type": "text/event-stream",
+					"Cache-Control": "no-cache",
+					Connection: "keep-alive",
+					"X-Accel-Buffering": "no",
+				});
+				const write = (event: { seq: number; type: string; at: number; data?: Record<string, unknown> }): void => {
+					res.write(`id: ${event.seq}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+				};
+				for (const event of service.eventBus.eventsSince(agentId, since)) write(event);
+
+				// A terminal agent needs no subscription: history is complete.
+				const terminal = ["completed", "failed", "cancelled"].includes(service.getAgent(agentId)?.state ?? "");
+				if (terminal) {
+					res.end();
+					return;
+				}
+				const subscription = service.eventBus.subscribe(agentId, (event) => {
+					write(event);
+					if (event.type === "agent.completed" || event.type === "agent.failed" || event.type === "agent.cancelled") {
+						subscription.unsubscribe();
+						res.end();
+					}
+				});
+				// Heartbeat keeps intermediaries from closing an idle stream.
+				const heartbeat = setInterval(() => res.write(": ping\n\n"), 15_000);
+				req.on("close", () => {
+					clearInterval(heartbeat);
+					subscription.unsubscribe();
+				});
 				return;
 			}
 			const agentMatch = /^\/v1\/agents\/([^/]+)$/.exec(url.pathname);

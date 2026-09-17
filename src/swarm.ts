@@ -10,12 +10,16 @@
  */
 
 import { AgentRuntime, type AgentSpec, type AgentState } from "./agent.ts";
-import { AccountRegistry, SEED_PROVIDERS, resolveKey, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
+import { AccountRegistry, resolveKey, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
+import { availableSeeds } from "./providers.ts";
 import { createLogger } from "./logger.ts";
 import { Dispatcher } from "./dispatcher.ts";
-import { ToolExecutor, registerBuiltinTools } from "./tools.ts";
+import { ToolExecutor, registerBuiltinTools, registerWorkspaceTools } from "./tools.ts";
 import { CancellationTree } from "./cancellation.ts";
 import { PersistentToolJournal } from "./tool-journal.ts";
+import { EventBus } from "./events.ts";
+import type { LeaseStore } from "./leases.ts";
+import type { Workspace } from "./workspace.ts";
 import { AgentStore, type AgentRow } from "./store.ts";
 import type { ChatMessage } from "./stream.ts";
 
@@ -60,22 +64,38 @@ export class SwarmService {
 	private readonly toolExecutor: ToolExecutor;
 	/** Live runtimes + parent links for tree cancellation. */
 	private readonly tree = new CancellationTree();
+	/** Per-agent progress events for the SSE endpoint. */
+	private readonly events = new EventBus();
+	/** Sandbox root for workspace tools (undefined = no workspace tools). */
+	readonly workspace: Workspace | undefined;
 	private agentCounter = 0;
 
-	constructor(options: { store?: AgentStore | undefined; accounts?: AccountRegistryEntry[]; tools?: ToolExecutor | undefined } = {}) {
+	constructor(options: {
+		store?: AgentStore | undefined;
+		accounts?: AccountRegistryEntry[];
+		tools?: ToolExecutor | undefined;
+		/** Sandbox root; enables the workspace tool set when provided. */
+		workspace?: Workspace | undefined;
+		/** Cross-process lease store (multi-worker deployments). */
+		leases?: LeaseStore | undefined;
+	} = {}) {
 		this.accounts = new AccountRegistry();
 		if (options.accounts) {
 			for (const account of options.accounts) this.accounts.register(account);
 		} else {
-			// Seed: keyless-catalog providers, one primary account each.
-			for (const seed of SEED_PROVIDERS) {
+			// Seed every provider that is usable right now: a credential
+			// resolves, or it serves chat anonymously. Providers that are
+			// merely listable stay out — a visible-but-unauthenticated
+			// provider only produces 401s and burns attempts (pi-free #530).
+			for (const seed of availableSeeds()) {
 				this.accounts.register({
 					accountId: `${seed.providerId}:primary`,
 					providerId: seed.providerId,
-					credentialRef: `${seed.providerId.toUpperCase().replace(/-/g, "_")}_API_KEY`,
+					credentialRef: seed.credentialRef,
 					enabled: true,
 					maxConcurrency: 4,
 					baseUrl: seed.baseUrl,
+					anonymousTier: seed.anonymousTier,
 				});
 			}
 		}
@@ -85,8 +105,13 @@ export class SwarmService {
 		this.toolExecutor = options.tools ?? new ToolExecutor({
 			journal: this.store ? new PersistentToolJournal(this.store) : undefined,
 		});
-		if (!options.tools) registerBuiltinTools(this.toolExecutor);
-		this.dispatcher = new Dispatcher({ accounts: this.accounts });
+		this.workspace = options.workspace;
+		if (!options.tools) {
+			registerBuiltinTools(this.toolExecutor);
+			// Workspace tools are opt-in: they need a sandbox root.
+			if (this.workspace) registerWorkspaceTools(this.toolExecutor, this.workspace);
+		}
+		this.dispatcher = new Dispatcher({ accounts: this.accounts, leases: options.leases });
 		// Logged-out accounts stay out of the pool when their chat needs a
 		// key (pi-free #530): only keyless-usable providers stay enabled
 		// without a credential. Cline/FastRouter list keyless but 401 on chat.
@@ -121,6 +146,7 @@ export class SwarmService {
 
 		const runtime = this.createRuntime(spec, now);
 		this.tree.register(spec.agentId, spec.parentAgentId, runtime);
+		this.events.emit(agentId, "agent.queued", { parent: spec.parentAgentId ?? null });
 		// Fire-and-forget with contained rejection (async job contract).
 		void runtime.run().catch(() => undefined);
 		return { agentId, duplicate: false };
@@ -131,6 +157,7 @@ export class SwarmService {
 			spec,
 			{
 				executeTurn: async (messages, opts) => {
+					this.events.emit(spec.agentId, "turn.routed", { turn: opts.turnIndex });
 					const result = await this.dispatcher.executeTurn(messages, opts, this.toolExecutor?.specs());
 					if (this.store && result.ok) {
 						this.store.recordAttempt({
@@ -144,21 +171,30 @@ export class SwarmService {
 							latencyMs: result.outcome.latencyMs,
 						});
 					}
+					if (!result.ok) {
+						this.events.emit(spec.agentId, "agent.failed", { turn: opts.turnIndex, reason: result.reason });
+					}
 					return result;
 				},
 			},
 			{
-				execute: (agentId, turnIndex, callId, tool, argsJson, signal) =>
-					this.toolExecutor.execute(agentId, turnIndex, callId, tool, argsJson, signal),
+				execute: async (agentId, turnIndex, callId, tool, argsJson, signal) => {
+					const result = await this.toolExecutor.execute(agentId, turnIndex, callId, tool, argsJson, signal);
+					// Counts and the tool NAME only — arguments stay out of events.
+					this.events.emit(agentId, "tool.executed", { turn: turnIndex, tool });
+					return result;
+				},
 			},
 			{
 				onStateChange: (state) => {
+					this.events.emit(spec.agentId, state === "running" ? "agent.started" : "agent.state", { state });
 					if (this.store) {
 						const row = this.store.getAgent(spec.agentId);
 						if (row) this.store.upsertAgent({ ...row, state, updatedAt: Date.now() });
 					}
 				},
 				onTurnCommitted: (turnIndex, content) => {
+					this.events.emit(spec.agentId, "turn.committed", { turn: turnIndex, chars: content.length });
 					// Durable transcript: the committed assistant message survives
 					// restarts so recovery can distinguish committed from lost.
 					if (this.store) {
@@ -169,6 +205,7 @@ export class SwarmService {
 					}
 				},
 				onComplete: (content) => {
+					this.events.emit(spec.agentId, "agent.completed", { chars: content.length });
 					if (this.store) {
 						const row = this.store.getAgent(spec.agentId);
 						if (row) this.store.upsertAgent({ ...row, state: "completed", updatedAt: Date.now(), finalContent: content });
@@ -176,6 +213,7 @@ export class SwarmService {
 					this.tree.unregister(spec.agentId);
 				},
 				onFail: (reason) => {
+					this.events.emit(spec.agentId, "agent.failed", { reason });
 					if (this.store) {
 						const row = this.store.getAgent(spec.agentId);
 						if (row) this.store.upsertAgent({ ...row, state: "failed", updatedAt: Date.now(), failReason: reason });
@@ -185,6 +223,11 @@ export class SwarmService {
 			},
 		);
 		return runtime;
+	}
+
+	/** Event stream access for the SSE endpoint and tests. */
+	get eventBus(): EventBus {
+		return this.events;
 	}
 
 	getAgent(agentId: string): (AgentRow & { transcript?: ReadonlyArray<ChatMessage> }) | undefined {
@@ -207,6 +250,7 @@ export class SwarmService {
 
 	cancelAgent(agentId: string): boolean {
 		const cancelled = this.tree.cancelTree(agentId);
+		for (const id of cancelled) this.events.emit(id, "agent.cancelled");
 		return cancelled.length > 0;
 	}
 

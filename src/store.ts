@@ -36,9 +36,19 @@ export class AgentStore {
 
 	constructor(path: string) {
 		this.db = new DatabaseSync(path);
+		// busy_timeout FIRST: several worker processes share this file, and
+		// switching to WAL itself takes a lock — without a timeout the second
+		// process to start fails immediately (observed in the multi-process
+		// lease test).
+		this.db.exec("PRAGMA busy_timeout = 5000;");
 		this.db.exec("PRAGMA journal_mode = WAL;");
 		this.db.exec("PRAGMA synchronous = NORMAL;");
 		this.migrate();
+	}
+
+	/** Raw handle for cooperating stores (leases) on the same database. */
+	get database(): DatabaseSync {
+		return this.db;
 	}
 
 	private migrate(): void {

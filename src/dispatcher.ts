@@ -20,6 +20,7 @@ import { selectTurnCandidate, type SelectorContext, type TurnRequirements } from
 import { streamTurn, type ChatMessage, type ToolSpec, type TurnOutcome } from "./stream.ts";
 import { fetchCatalog, resolveKey, wireModelIsChat, wireModelIsFree, type AccountRegistry, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
 import { computeRetryBackoffMs, sleep } from "./fetch.ts";
+import type { LeaseStore, TurnLease } from "./leases.ts";
 import type { HeaderQuota } from "./quota-headers.ts";
 import type { Candidate } from "./types.ts";
 
@@ -46,6 +47,14 @@ export interface DispatcherOptions {
 	defaultMaxConcurrency?: number;
 	/** Max staged output tokens for the reserve estimate. */
 	defaultMaxOutputTokens?: number;
+	/**
+	 * Cross-process lease store. When provided, the dispatcher acquires a
+	 * fenced lease before sending and validates it before committing, so
+	 * several worker processes cannot overspend one account.
+	 */
+	leases?: LeaseStore | undefined;
+	/** Lease duration; must exceed a turn's wall time. */
+	leaseTtlMs?: number;
 }
 
 interface ModelHealth {
@@ -66,6 +75,8 @@ export class Dispatcher {
 	private readonly fetchModels: (account: AccountRegistryEntry) => Promise<WireModel[]>;
 	private readonly defaultMaxConcurrency: number;
 	private readonly defaultMaxOutputTokens: number;
+	private readonly leases: LeaseStore | undefined;
+	private readonly leaseTtlMs: number;
 	/** "accountId/modelId" → health. */
 	private readonly health = new Map<string, ModelHealth>();
 	/** providerId → accounts. */
@@ -85,6 +96,8 @@ export class Dispatcher {
 		});
 		this.defaultMaxConcurrency = options.defaultMaxConcurrency ?? 4;
 		this.defaultMaxOutputTokens = options.defaultMaxOutputTokens ?? 4096;
+		this.leases = options.leases;
+		this.leaseTtlMs = options.leaseTtlMs ?? 5 * 60 * 1000;
 		for (const account of this.accounts.all()) {
 			const list = this.accountsByProvider.get(account.providerId) ?? [];
 			list.push(account);
@@ -108,12 +121,13 @@ export class Dispatcher {
 			}
 			// Chat-capable models only (image/video generators share the endpoint).
 			const chatModels = models.filter((model) => wireModelIsChat(model));
-			// Anonymous accounts: restrict to the keyless-usable tier (llm7
-			// "pro" models 401 without a key even though the catalog lists
-			// them — verified live).
+			// Anonymous accounts: restrict to the keyless-usable tier. The tier
+			// name is per-account (llm7 uses "turbo"; verified live that its
+			// "pro" models 401 without a key even though the catalog lists them).
 			const anonymous = !resolveKey(account);
-			const usable = anonymous
-				? chatModels.filter((model) => model.tier === undefined || model.tier === "turbo")
+			const anonymousTier = account.anonymousTier;
+			const usable = anonymous && anonymousTier !== undefined
+				? chatModels.filter((model) => model.tier === undefined || model.tier === anonymousTier)
 				: chatModels;
 			// Free-first: when the catalog exposes ANY zero-priced chat model,
 			// restrict to those (free-only policy). Catalogs with no free chat
@@ -334,6 +348,29 @@ export class Dispatcher {
 			}
 			const reservationId = reservation.reservation.id;
 			this.quota.markSent(reservationId);
+
+			// Cross-process gate: a fenced lease admits this turn only when the
+			// ACCOUNT has free capacity across every worker process. Without a
+			// lease store the in-process ledger is the only gate (single-process
+			// mode). A refused lease means another process holds the capacity —
+			// wait rather than fail (backpressure, acceptance #3).
+			const lease = this.leases?.acquire({
+				accountId: candidate.accountId,
+				agentId: opts.agentId,
+				turnIndex: opts.turnIndex,
+				maxConcurrency: account.maxConcurrency || this.defaultMaxConcurrency,
+				ttlMs: this.leaseTtlMs,
+			}) ?? null;
+			if (this.leases && lease === null) {
+				this.quota.release(reservationId);
+				if (Date.now() < this.turnDeadline) {
+					await sleep(2_000);
+					continue; // does NOT consume an attempt
+				}
+				excludeAccounts.add(candidate.accountId);
+				continue;
+			}
+
 			attempt += 1; // a SENT request consumes the attempt budget
 
 			const outcome = await streamTurn({
@@ -349,6 +386,20 @@ export class Dispatcher {
 			this.applyQuotaObservation(candidate.accountId, outcome.quota, outcome.ok ? outcome.usage?.totalTokens : undefined);
 
 			if (outcome.ok) {
+				// Fence check: if another worker took this account's capacity
+				// while we streamed (our lease expired and was re-issued), the
+				// work is stale — do not commit it against someone else's slot.
+				if (this.leases && lease && !this.leases.validate(lease)) {
+					this.quota.release(reservationId);
+					this.leases.release(lease.leaseId);
+					_logger.info("stale_lease_rejected", {
+						agentId: opts.agentId,
+						account: candidate.accountId,
+						token: lease.fencingToken,
+					});
+					excludeAccounts.add(candidate.accountId);
+					continue;
+				}
 				// Model-defect guard: a 200 with neither content nor tool calls
 				// is not an answer. Reasoning-only models (llm7's GLM returns
 				// empty `content` with the text in `reasoning`) land here, and
@@ -357,6 +408,7 @@ export class Dispatcher {
 				// reroute — a different model may answer properly.
 				if (outcome.content.trim().length === 0 && outcome.toolCalls.length === 0) {
 					this.quota.commit(reservationId, outcome.usage?.totalTokens ?? 0);
+					this.releaseLease(lease);
 					this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, "empty_response", Date.now());
 					excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
 					this.recordHealth(candidate, outcome.latencyMs, false);
@@ -371,6 +423,7 @@ export class Dispatcher {
 					continue;
 				}
 				this.quota.commit(reservationId, outcome.usage?.totalTokens ?? 0);
+				this.releaseLease(lease);
 				this.circuit.recordSuccess(candidate.accountId);
 				this.blacklist.clear(`${candidate.accountId}/${candidate.modelId}`);
 				this.recordHealth(candidate, outcome.latencyMs, true);
@@ -379,6 +432,7 @@ export class Dispatcher {
 
 			// --- Failure path: charge the sent reservation, classify, decide.
 			this.quota.commit(reservationId, estimatedTokens);
+			this.releaseLease(lease);
 			this.recordHealth(candidate, outcome.latencyMs, false);
 
 			const abortedWithServerError = outcome.errorMessage === "aborted"
@@ -431,24 +485,44 @@ export class Dispatcher {
 				continue;
 			}
 
-			// Unrecoverable: account/model-specific disable, fail the turn.
-			if (cls === "auth" || cls === "policy") {
-				// Anonymous accounts: llm7 lists "pro" models that 401 per MODEL
-				// while other models on the same keyless account serve fine
-				// (verified live: DeepSeek 401 × 3, GLM 200 seconds later).
-				// Disable the MODEL, not the whole account — the account is
-				// only account-fatal when a credential is present (then 401
-				// really means the key is dead).
-				if (resolveKey(account)) {
-					this.circuit.openUntil(candidate.accountId, Number.MAX_SAFE_INTEGER, Date.now());
-					return { ok: false, reason: cls };
-				}
-				// Anonymous: hard-ban the model for this process session.
-				this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, cls, Date.now());
-				this.anonModelBans.add(`${candidate.accountId}/${candidate.modelId}`);
-				excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
-				continue; // try another model on the same account
+			// Unrecoverable for the MODEL, but not necessarily for the account:
+		// gateways scope entitlements per model (verified live: llm7 401s on
+		// some turbo models while GLM serves; bai 403s on one model while
+		// others answer). So: strike the MODEL, exclude it, and reroute.
+		// The ACCOUNT only dies when ≥2 distinct models fail this way — that
+		// is a credential problem, not a model entitlement.
+		if (cls === "auth" || cls === "policy") {
+			const modelKey = `${candidate.accountId}/${candidate.modelId}`;
+			this.blacklist.recordFailure(modelKey, cls, Date.now());
+			if (cls === "auth" && !resolveKey(account)) this.anonModelBans.add(modelKey);
+			excludeModels.add(modelKey);
+
+			let distinctCredentialFailures = 0;
+			for (const key of this.blacklist.snapshot().keys()) {
+				if (!key.startsWith(`${candidate.accountId}/`)) continue;
+				const entry = this.blacklist.snapshot().get(key);
+				if (entry?.reasons.some((reason) => reason === "auth" || reason === "policy")) distinctCredentialFailures += 1;
 			}
+			if (distinctCredentialFailures >= 2) {
+				// Multiple models rejected: the credential itself is bad.
+				this.circuit.openUntil(candidate.accountId, Number.MAX_SAFE_INTEGER, Date.now());
+				excludeAccounts.add(candidate.accountId);
+				_logger.info("account_disabled_credentials", {
+					agentId: opts.agentId,
+					account: candidate.accountId,
+					distinctModels: distinctCredentialFailures,
+				});
+			}
+			_logger.info("credential_scoped_reroute", {
+				agentId: opts.agentId,
+				account: candidate.accountId,
+				model: candidate.modelId,
+				cls,
+				attempt,
+			});
+			await sleep(computeRetryBackoffMs(attempt - 1, 500));
+			continue; // try another model (or another account)
+		}
 			if (cls === "bad_request" && tools && tools.length > 0) {
 				// A 400 on a TOOL-BEARING request usually means this model does
 				// not accept the tool payload (observed live: mistral-Nemo via
@@ -475,6 +549,16 @@ export class Dispatcher {
 		}
 
 		return { ok: false, reason: "attempts_exhausted" };
+	}
+
+	/** Release a lease if one was taken (no-op in single-process mode). */
+	private releaseLease(lease: TurnLease | null): void {
+		if (this.leases && lease) this.leases.release(lease.leaseId);
+	}
+
+	/** Current live leases for an account (diagnostics for /v1/capacity). */
+	activeLeases(accountId: string): TurnLease[] {
+		return this.leases?.activeFor(accountId) ?? [];
 	}
 
 	private applyQuotaObservation(

@@ -38,15 +38,10 @@ export interface CatalogFetchResult {
 export const CATALOG_TTL_MS = 60 * 60 * 1000; // 1 hour (pi-free cache-first)
 export const CATALOG_FETCH_TIMEOUT_MS = 8_000; // pi-free startup deadline
 
-/** Known keyless/anonymous catalog providers (plan Phase 0 seed). */
-export const SEED_PROVIDERS: ReadonlyArray<{ providerId: string; baseUrl: string }> = [
-	{ providerId: "llm7", baseUrl: "https://api.llm7.io/v1" },
-	{ providerId: "cline", baseUrl: "https://api.cline.bot/api/v1" },
-	{ providerId: "fastrouter", baseUrl: "https://api.fastrouter.ai/api/v1" },
-];
-
 export interface AccountRegistryEntry extends ProviderAccount {
 	baseUrl: string;
+	/** For anonymous accounts: the only tier reachable without a key. */
+	anonymousTier?: string | undefined;
 }
 
 /** In-memory account registry. Persistence arrives with the store layer. */

@@ -10,20 +10,71 @@ generalized from "rescue one session" to "schedule N concurrent agents".
 
 ## Status
 
-Phases 2–3 of the plan are functional and verified live:
+**All phases of the plan are implemented and verified.** 113 tests green.
 
-- **83 unit/integration tests green** (quota registry, classifier, blacklist,
-  selector, header parsing, circuit breaker, dispatcher, tool journal,
-  tool executor, tool loop end-to-end over real HTTP, cancellation tree,
-  crash recovery)
-- **Live smoke verified** against llm7's anonymous free tier:
-  - single agent: spawn → stream → commit → `"4"` (2+2)
-  - **6 concurrent agents: 6/6 completed** through a provider whose real
-    anonymous limit is ~1 concurrent request — the dispatcher queues behind
-    capacity instead of failing (acceptance criterion #3)
-  - **tool-using agent: completed** with the correct answer after executing
-    the calculator and rerouting once off a model that rejected the tool
-    payload (`tool_unsupported_reroute`)
+| Phase | Scope | State |
+| --- | --- | --- |
+| 0 | Empirical provider audit | ✅ `scripts/audit-providers.ts` → `docs/provider-audit.md` |
+| 1 | Pure scheduler + simulator | ✅ quota registry, selector, blacklist, circuit breaker |
+| 2 | Single-node backend | ✅ dispatcher, agent runtime, SQLite, control API |
+| 3 | Reliable agent execution | ✅ tool journal, workspaces, cancellation tree, recovery |
+| 4 | Provider rollout + surfaces | ✅ 23-provider catalog, SSE events, sandboxed tools |
+| 5 | Scale-out | ✅ **gated by measurement** — see `docs/phase5-evidence.md` |
+
+### Verified live (llm7 anonymous tier + 2 keyed providers)
+
+| Scenario | Result |
+| --- | --- |
+| Single agent, simple task | completed, correct answer |
+| 6 concurrent agents, 1-slot provider | **6/6 completed** via capacity queueing |
+| 429 on one model | rerouted to another model on the same account |
+| 401/403 on one model | model excluded, turn rerouted (entitlements are per-model) |
+| 400 on a tool-bearing request | model excluded, rerouted, turn completed |
+| Empty 200 from a reasoning-only model | model struck, rerouted |
+| Repeated identical tool call | run stopped early (`tool_loop_detected`) |
+| **Workspace tools** | `write_file` → `notes/hello.txt` created inside the sandbox; `read_file` returned it |
+| **SSE stream** | `agent.queued → agent.started → tool.executed ×2 → turn.committed` captured live |
+| Cancel mid-run | agent cancelled, no circuit strike |
+| Restart with a live agent | marked interrupted, transcript preserved |
+| 40 concurrent agents with leases | **40/40 completed** (bench harness) |
+| Two OS processes, cap = 1 account | mutual exclusion held, no starvation (test) |
+
+## Workspaces (sandbox boundary)
+
+Tool execution is confined by `Workspace`:
+
+- **Filesystem boundary** — every path is root-relative; `..`, absolute paths,
+  and symlinks that resolve outside the root are rejected (`path_escape`).
+- **Command allowlist** — `echo`, `cat`, `ls`, `wc`, `head`, `tail`, `grep`,
+  `sort`, `uniq`, `node`, `python3` by default; anything else is
+  `command_denied`.
+- **Environment allowlist** — only `PATH`, `HOME`, `LANG`, `LC_ALL`, `TZ`,
+  `TMPDIR` reach a child process; secrets in the parent env do not leak.
+- **Timeout + output cap + abort** — a hung command is killed (process group),
+  output is capped, and an agent abort kills the tree.
+
+Tools: `read_file`, `write_file`, `list_dir`, `run_command`.
+
+## Leases and fencing (multi-process safety)
+
+The in-process quota ledger cannot stop a second process from spending the
+same account. `SqliteLeaseStore` is the shared gate:
+
+- `acquire` atomically admits a turn only when the account has fewer than
+  `maxConcurrency` live leases (`BEGIN IMMEDIATE` serializes across processes).
+- Every lease carries a monotonic **fencing token** per account.
+- Validity is row-existence + expiry; the token guards single-holder
+  downstream resources.
+- A **fairness cooldown** stops a worker re-acquiring an account in the same
+  millisecond and monopolizing it (measured: 10/0 split before, fair after).
+- Crashed workers' leases are swept, not leaked.
+
+## Events (SSE)
+
+`GET /v1/agents/:id/events` replays the agent's history, then streams live
+(`?since=<seq>` resumes after a reconnect). Events carry metadata only —
+state, turn index, tool NAME, counts, error class. Never prompts, tool
+arguments, or response bodies.
 
 ## Tool runtime (Phase 3)
 
@@ -104,14 +155,18 @@ Key decisions (full rationale in the plan doc):
 | `src/swarm.ts` | Service facade: spawn/status/cancel/capacity |
 | `src/server.ts` | HTTP control API (node:http, zero deps) |
 | `src/tool-journal.ts` | Stable-id tool journal (in-memory + SQLite-backed) |
-| `src/tools.ts` | Tool executor + built-ins (calculator, echo, fetch_text) |
+| `src/tools.ts` | Tool executor + built-ins + workspace tools |
+| `src/workspace.ts` | Sandbox: filesystem boundary, command/env allowlists, timeouts |
 | `src/cancellation.ts` | Parent/child tree, post-order recursive cancel |
 | `src/recovery.ts` | Restart reconciliation: interrupted agents, uncertain tools |
+| `src/events.ts` | Per-agent event ring + subscribers (SSE source) |
+| `src/leases.ts` | Fenced leases: cross-process capacity gate + fairness |
+| `src/providers.ts` | 23-provider catalog with credential refs and categories |
 
 ## API
 
 ```bash
-# start (seeds llm7/cline/fastrouter, keyless catalogs where usable)
+# start (seeds every provider whose credential resolves, plus keyless-chat ones)
 npm run dev
 
 # spawn an agent
@@ -121,10 +176,11 @@ curl -X POST localhost:7463/v1/agents -H 'Content-Type: application/json' \
        "qualityFloor":null,"allowUnknownQuality":true},
        "idempotencyKey":"unique-key"}'
 
-# status / cancel / capacity
+# status / cancel / capacity / events
 curl localhost:7463/v1/agents/<id>
 curl -X DELETE localhost:7463/v1/agents/<id>
 curl localhost:7463/v1/capacity
+curl -N localhost:7463/v1/agents/<id>/events        # SSE; ?since=<seq> resumes
 ```
 
 Accounts resolve credentials from env (`LLM7_API_KEY`, `CLINE_API_KEY`,
@@ -132,26 +188,36 @@ Accounts resolve credentials from env (`LLM7_API_KEY`, `CLINE_API_KEY`,
 tiers (llm7 `turbo`); logged-out accounts whose chat needs a key are excluded
 entirely (pi-free #530 rule).
 
-## Verified live behavior (llm7 anonymous)
+## Auditing providers
 
-| Scenario | Result |
-| --- | --- |
-| Single agent, simple task | completed, correct answer |
-| 6 concurrent agents, 1-slot provider | **6/6 completed** via queueing |
-| 429 on one model | rerouted to a different model on the same account |
-| 401 on one model (anon) | model banned for session; account kept serving |
-| 400 on a tool-bearing request | model excluded, rerouted, turn completed |
-| Empty 200 from a reasoning-only model | model struck, rerouted (mock-verified) |
-| Repeated identical tool call | run stopped early (`tool_loop_detected`) |
-| Cancel mid-run | agent cancelled, no circuit strike |
-| Restart with a live agent | marked interrupted, transcript preserved |
+```bash
+npx tsx scripts/audit-providers.ts --chat          # all providers → docs/provider-audit.md
+npx tsx scripts/audit-providers.ts --chat --only llm7,cline
+npx tsx scripts/probe-chat.ts llm7 GLM-5.3-Flash   # one model, header names printed
+```
 
-## Next (plan phases 4–5)
+The audit records catalog reachability, free/paid classification, **which
+rate-limit header names each provider actually sends**, and which models
+answer a chat probe. Credential values are never printed.
 
-- Phase 4: provider rollout with live quota audits per provider; isolated
-  workspaces for tool execution (container/sandbox boundary); SSE event stream
-- Phase 5 (only on evidence): shared Redis ledger, multi-process workers,
-  lease fencing tokens
+Key finding (2026-09-17): **no provider in the catalog sends rate-limit
+headers on `/models`**, and anonymous access is per-MODEL rather than
+per-tier. That is why the dispatcher runs unknown-quota buckets in probation
+mode and treats 401/403 as model-scoped exclusions rather than account deaths.
+
+## Load testing
+
+```bash
+npx tsx scripts/bench-scheduler.ts 12 4            # 333 turns/sec
+npx tsx scripts/bench-scheduler.ts 40 6 --leases   # 58 turns/sec, 40/40 completed
+```
+
+## Scaling
+
+Scale by adding worker processes that share one SQLite database — the lease
+store is the coordination point and is already tested for mutual exclusion.
+The distributed (Redis) ledger is **not** justified by measurement; see
+`docs/phase5-evidence.md` for the numbers and the revisit criteria.
 
 ## License
 

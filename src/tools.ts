@@ -15,6 +15,7 @@
 
 import { createLogger } from "./logger.ts";
 import { InMemoryToolJournal, toolExecutionId, type ToolJournal } from "./tool-journal.ts";
+import { WorkspaceError, type Workspace } from "./workspace.ts";
 import type { ToolSpec } from "./stream.ts";
 
 const _logger = createLogger("tools");
@@ -191,5 +192,90 @@ export function registerBuiltinTools(executor: ToolExecutor): void {
 			const body = await response.text();
 			return JSON.stringify({ status: response.status, truncated: body.length > maxChars, text: body.slice(0, maxChars) });
 		},
+	});
+}
+
+/**
+ * Register the workspace-scoped tool set: filesystem access and command
+ * execution confined to one sandbox root. Errors come back as JSON content
+ * (the model reacts to them) — never as thrown failures.
+ */
+export function registerWorkspaceTools(executor: ToolExecutor, workspace: Workspace): void {
+	/** Uniform error-to-content mapping for every workspace tool. */
+	const guard = async (fn: () => Promise<unknown>): Promise<string> => {
+		try {
+			return JSON.stringify(await fn());
+		} catch (error) {
+			if (error instanceof WorkspaceError) {
+				return JSON.stringify({ error: error.code, detail: error.message });
+			}
+			return JSON.stringify({ error: "workspace_error", detail: error instanceof Error ? error.message : String(error) });
+		}
+	};
+
+	executor.register("read_file", {
+		description: "Read a UTF-8 text file from the workspace. Paths are relative to the workspace root.",
+		parameters: {
+			type: "object",
+			properties: { path: { type: "string", description: "Workspace-relative file path." } },
+			required: ["path"],
+		},
+		execute: async (args, ctx) =>
+			guard(async () => {
+				const path = String(args["path"] ?? "");
+				const content = await workspace.readFile(path, ctx.signal);
+				return { path, content };
+			}),
+	});
+
+	executor.register("write_file", {
+		description: "Write a UTF-8 text file in the workspace, creating parent directories.",
+		parameters: {
+			type: "object",
+			properties: {
+				path: { type: "string", description: "Workspace-relative file path." },
+				content: { type: "string", description: "File contents." },
+			},
+			required: ["path", "content"],
+		},
+		execute: async (args, ctx) =>
+			guard(async () => {
+				const path = String(args["path"] ?? "");
+				const bytes = await workspace.writeFile(path, String(args["content"] ?? ""), ctx.signal);
+				return { path, bytesWritten: bytes };
+			}),
+	});
+
+	executor.register("list_dir", {
+		description: "List a directory in the workspace (defaults to the root).",
+		parameters: {
+			type: "object",
+			properties: { path: { type: "string", description: "Workspace-relative directory path." } },
+		},
+		execute: async (args) =>
+			guard(async () => {
+				const path = String(args["path"] ?? ".");
+				const entries = await workspace.listDir(path);
+				return { path, entries };
+			}),
+	});
+
+	executor.register("run_command", {
+		description: "Run an allowlisted shell command inside the workspace with a timeout and capped output.",
+		parameters: {
+			type: "object",
+			properties: {
+				command: { type: "string", description: "Executable name (allowlisted)." },
+				args: { type: "array", items: { type: "string" }, description: "Arguments." },
+			},
+			required: ["command"],
+		},
+		execute: async (args, ctx) =>
+			guard(async () => {
+				const command = String(args["command"] ?? "");
+				const commandArgs = Array.isArray(args["args"]) ? (args["args"] as unknown[]).map(String) : [];
+				const result = await workspace.runCommand(command, commandArgs, ctx.signal);
+				return result;
+			}),
 	});
 }
