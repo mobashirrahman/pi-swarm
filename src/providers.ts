@@ -70,6 +70,16 @@ export const PROVIDER_SEEDS: ReadonlyArray<ProviderSeed> = [
 	{ providerId: "zai", baseUrl: "https://api.z.ai/api/paas/v4", credentialRef: "ZAI_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
 	{ providerId: "orcarouter", baseUrl: "https://api.orcarouter.ai/v1", credentialRef: "ORCAROUTER_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
 	{ providerId: "tium", baseUrl: "https://api.tium.ai/v1", credentialRef: "TIUM_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
+	// Base URLs taken from the harness's own models.yml, which is authoritative
+	// for these gateways (my first guesses at the hostnames were wrong for five
+	// of six — api.sail.ai vs api.sailresearch.com, api.above.ai vs
+	// api.above.dev, api.tiyuvta.com vs api.tiyuvta.ai, api.xkiro.ai vs
+	// api.xkiro.com, api.bynara.ai vs router.bynara.id).
+	{ providerId: "sail", baseUrl: "https://api.sailresearch.com/v1", credentialRef: "SAIL_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
+	{ providerId: "above", baseUrl: "https://api.above.dev/v1", credentialRef: "ABOVE_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
+	{ providerId: "tiyuvta", baseUrl: "https://api.tiyuvta.ai/v1", credentialRef: "TIYUVTA_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
+	{ providerId: "xkiro", baseUrl: "https://api.xkiro.com/v1", credentialRef: "XKIRO_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
+	{ providerId: "bynara", baseUrl: "https://router.bynara.id/v1", credentialRef: "BYNARA_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
 ];
 
 export function seedById(providerId: string): ProviderSeed | undefined {

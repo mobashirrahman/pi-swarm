@@ -41,11 +41,11 @@ const CANDIDATES: Candidate[] = [
 	{ credential: "CLOUDFLARE_API_KEY", providerId: "cloudflare", baseUrl: "https://api.cloudflare.com/client/v4/accounts" },
 	{ credential: "ORCAROUTER_API_KEY", providerId: "orcarouter", baseUrl: "https://api.orcarouter.ai/v1" },
 	{ credential: "TIUM_API_KEY", providerId: "tium", baseUrl: "https://api.tium.ai/v1" },
-	{ credential: "SAIL_API_KEY", providerId: "sail", baseUrl: "https://api.sail.ai/v1" },
-	{ credential: "ABOVE_API_KEY", providerId: "above", baseUrl: "https://api.above.ai/v1" },
-	{ credential: "TIYUVTA_API_KEY", providerId: "tiyuvta", baseUrl: "https://api.tiyuvta.com/v1" },
-	{ credential: "XKIRO_API_KEY", providerId: "xkiro", baseUrl: "https://api.xkiro.ai/v1" },
-	{ credential: "BYNARA_API_KEY", providerId: "bynara", baseUrl: "https://api.bynara.ai/v1" },
+	{ credential: "SAIL_API_KEY", providerId: "sail", baseUrl: "https://api.sailresearch.com/v1" },
+	{ credential: "ABOVE_API_KEY", providerId: "above", baseUrl: "https://api.above.dev/v1" },
+	{ credential: "TIYUVTA_API_KEY", providerId: "tiyuvta", baseUrl: "https://api.tiyuvta.ai/v1" },
+	{ credential: "XKIRO_API_KEY", providerId: "xkiro", baseUrl: "https://api.xkiro.com/v1" },
+	{ credential: "BYNARA_API_KEY", providerId: "bynara", baseUrl: "https://router.bynara.id/v1" },
 	{ credential: "KAGGLE_API_KEY", providerId: "kaggle", baseUrl: "https://www.kaggle.com/api/v1" },
 ];
 
