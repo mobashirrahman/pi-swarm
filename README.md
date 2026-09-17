@@ -163,6 +163,49 @@ Key decisions (full rationale in the plan doc):
 | `src/leases.ts` | Fenced leases: cross-process capacity gate + fairness |
 | `src/providers.ts` | 23-provider catalog with credential refs and categories |
 
+## Using it inside Oh My Pi / OpenCode
+
+pi-swarm is an **MCP server**, so MCP-capable agents get it as native tools
+(`mcp__swarm_spawn`, `mcp__swarm_wait`, …). Full guide:
+[`docs/using-in-agents.md`](docs/using-in-agents.md).
+
+**Oh My Pi** — `.omp/mcp.json` (project) or `~/.omp/agent/mcp.json` (user):
+
+```json
+{
+  "mcpServers": {
+    "swarm": {
+      "command": "npx",
+      "args": ["tsx", "/path/to/pi-swarm/src/mcp-server.ts"]
+    }
+  }
+}
+```
+
+**OpenCode** — `opencode.json` (OMP reads this file too, so one config can
+serve both):
+
+```json
+{
+  "mcp": {
+    "swarm": {
+      "type": "local",
+      "command": ["npx", "tsx", "/path/to/pi-swarm/src/mcp-server.ts"]
+    }
+  }
+}
+```
+
+Two backends: **embedded** (default — the MCP server runs the swarm
+in-process, no daemon) or **proxy** (`PI_SWARM_URL=http://localhost:7463` to
+share one swarm across sessions). Verify the wiring with:
+
+```bash
+npx tsx scripts/mcp-client-demo.ts "What is 12*12? Answer with just the number."
+```
+
+Diagnostics always go to stderr; stdout carries JSON-RPC frames only.
+
 ## API
 
 ```bash

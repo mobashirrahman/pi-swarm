@@ -12,7 +12,11 @@
 		"test:run": "vitest run",
 		"lint": "tsc --noEmit",
 		"dev": "tsx src/server.ts",
-		"start": "tsx src/server.ts"
+		"start": "tsx src/server.ts",
+		"mcp": "tsx src/mcp-server.ts",
+		"mcp:demo": "tsx scripts/mcp-client-demo.ts",
+		"audit": "tsx scripts/audit-providers.ts --chat",
+		"bench": "tsx scripts/bench-scheduler.ts"
 	},
 	"devDependencies": {
 		"@types/node": "^22.20.3",

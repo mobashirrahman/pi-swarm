@@ -1,0 +1,17 @@
+{
+	"$schema": "https://opencode.ai/config.json",
+	"mcp": {
+		"swarm": {
+			"type": "local",
+			"command": [
+				"npx",
+				"tsx",
+				"/Users/mobashirrahman/Documents/pi-swarm/src/mcp-server.ts"
+			],
+			"environment": {
+				"PI_SWARM_DB": "/Users/mobashirrahman/Documents/pi-swarm/.pi-swarm.db",
+				"PI_SWARM_WORKSPACE": "/Users/mobashirrahman/Documents/pi-swarm/.pi-swarm-workspace"
+			}
+		}
+	}
+}

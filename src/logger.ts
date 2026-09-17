@@ -47,9 +47,10 @@ function emit(level: LogLevel, ns: string, message: string, fields?: Record<stri
 		pid: process.pid,
 		...fields,
 	};
-	const line = JSON.stringify(entry);
-	if (level === "error") console.error(line);
-	else console.log(line);
+	// ALWAYS stderr. stdout belongs to the program's actual output — for the
+	// MCP stdio server that stream carries JSON-RPC frames, and a single log
+	// line there corrupts the protocol.
+	process.stderr.write(`${JSON.stringify(entry)}\n`);
 }
 
 export interface Logger {
