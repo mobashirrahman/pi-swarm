@@ -144,10 +144,20 @@ export class Dispatcher {
 				: chatModels;
 			// Free-first: when the catalog exposes ANY zero-priced chat model,
 			// restrict to those (free-only policy). Catalogs with no free chat
-			// models (e.g. trial-credit gateways) keep their full list —
-			// free/paid enforcement happens at selection time via allowPaid.
-			const freeModels = usable.filter((model) => wireModelIsFree(model));
-			const visible = freeModels.length > 0 ? freeModels : usable;
+			// models keep their full list — free/paid enforcement then depends
+			// on the declared category.
+			//
+			// Category guard: a PAID provider whose catalog carries no pricing
+			// cannot be verified free, and the "no pricing ⇒ free" heuristic
+			// would route straight to paid models (OpenAI lists 124 models with
+			// no prices). Only providers declared free/freemium may use the
+			// unpriced-means-free assumption.
+			const unpricedMeansFree = account.category !== "paid";
+			const freeModels = usable.filter((model) => {
+				if (model.pricing === undefined) return unpricedMeansFree;
+				return wireModelIsFree(model);
+			});
+			const visible = freeModels.length > 0 ? freeModels : unpricedMeansFree ? usable : [];
 			for (const model of visible) {
 				candidates.push({
 					accountId: account.accountId,
@@ -162,6 +172,15 @@ export class Dispatcher {
 		}
 		this.candidatesCache = candidates;
 		return candidates;
+	}
+
+	/** Candidate counts per account, for the capacity view. */
+	candidateCounts(): Map<string, number> {
+		const counts = new Map<string, number>();
+		for (const candidate of this.getCandidates()) {
+			counts.set(candidate.accountId, (counts.get(candidate.accountId) ?? 0) + 1);
+		}
+		return counts;
 	}
 
 	private getCandidates(): Candidate[] {
@@ -593,7 +612,21 @@ export class Dispatcher {
 				continue;
 			}
 			if (cls === "model_gone") {
+				// A 404/410 means THIS model id is gone, not that the turn is
+				// doomed: with hundreds of candidates, reroute. Failing here
+				// killed turns whose pool was almost entirely healthy
+				// (measured: 2 of 6 concurrent agents died with model_gone while
+				// 656 candidates were available). The model is excluded for the
+				// rest of the turn; the account stays eligible.
 				this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, cls, Date.now());
+				excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
+				_logger.info("model_gone_reroute", {
+					agentId: opts.agentId,
+					account: candidate.accountId,
+					model: candidate.modelId,
+					attempt,
+				});
+				continue;
 			}
 			return { ok: false, reason: cls };
 		}

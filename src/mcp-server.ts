@@ -21,6 +21,7 @@ import { SwarmService } from "./swarm.ts";
 import { Workspace } from "./workspace.ts";
 import { SqliteLeaseStore } from "./leases.ts";
 import { recoverInterrupted } from "./recovery.ts";
+import { loadConfiguredEnvFile } from "./env-file.ts";
 import type { AgentSpec } from "./agent.ts";
 
 const SERVER_NAME = "pi-swarm";
@@ -216,6 +217,15 @@ class HttpBackend implements SwarmBackend {
 
 /** Build the backend the environment asks for. */
 export async function createBackend(): Promise<SwarmBackend> {
+	// Load provider credentials from PI_SWARM_ENV_FILE before anything reads
+	// them. Only NAMES are reported — values never reach the log.
+	const envReport = loadConfiguredEnvFile();
+	if (envReport.path !== undefined) {
+		process.stderr.write(
+			`${JSON.stringify({ ns: "mcp", msg: "env_file_loaded", path: envReport.path, loaded: envReport.loaded.length, skipped: envReport.skipped.length, problems: envReport.problems.length })}\n`,
+		);
+	}
+
 	const url = process.env["PI_SWARM_URL"];
 	if (url !== undefined && url.length > 0) return new HttpBackend(url.replace(/\/$/, ""));
 

@@ -14,6 +14,7 @@ import { SwarmService } from "./swarm.ts";
 import { SqliteLeaseStore } from "./leases.ts";
 import { Workspace } from "./workspace.ts";
 import { recoverInterrupted } from "./recovery.ts";
+import { loadConfiguredEnvFile } from "./env-file.ts";
 import { createLogger } from "./logger.ts";
 
 const _logger = createLogger("server");
@@ -34,6 +35,16 @@ async function readBody(req: IncomingMessage): Promise<string> {
 }
 
 async function main(): Promise<number> {
+	// Credentials from PI_SWARM_ENV_FILE, loaded before any provider is seeded.
+	const envReport = loadConfiguredEnvFile();
+	if (envReport.path !== undefined) {
+		_logger.info("env_file_loaded", {
+			path: envReport.path,
+			loaded: envReport.loaded.length,
+			skipped: envReport.skipped.length,
+			problems: envReport.problems.length,
+		});
+	}
 	const store = new AgentStore(DB_PATH);
 	// Cross-process capacity gate: several worker processes sharing one
 	// database cannot overspend an account's concurrency.

@@ -96,6 +96,7 @@ export class SwarmService {
 					maxConcurrency: 4,
 					baseUrl: seed.baseUrl,
 					anonymousTier: seed.anonymousTier,
+					category: seed.category,
 				});
 			}
 		}
@@ -265,6 +266,9 @@ export class SwarmService {
 	// =========================================================================
 
 	capacity(): CapacityView[] {
+		// Candidate counts (routable models), not quota-bucket counts — the
+		// bucket count read as "models=0" and made a healthy pool look empty.
+		const candidates = this.dispatcher.candidateCounts();
 		return this.accounts.all().map((account) => {
 			const circuit = this.dispatcher.circuit.get(account.accountId);
 			const minuteBucket = this.dispatcher.quota
@@ -278,7 +282,7 @@ export class SwarmService {
 				cooldownUntil: circuit.cooldownUntil,
 				inFlight: this.dispatcher.quota.inFlightCount(account.accountId),
 				remainingMinute: minuteBucket?.remaining,
-				models: this.dispatcher.quota.getAccountBuckets(account.accountId).length,
+				models: candidates.get(account.accountId) ?? 0,
 			};
 		});
 	}

@@ -61,6 +61,15 @@ export const PROVIDER_SEEDS: ReadonlyArray<ProviderSeed> = [
 	{ providerId: "infron", baseUrl: "https://llm.onerouter.pro/v1", credentialRef: "INFRON_API_KEY", anonymousCatalog: true, anonymousChat: false, category: "paid" },
 	{ providerId: "merge", baseUrl: "https://api-gateway.merge.dev/v1/openai", credentialRef: "MERGE_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "paid" },
 	{ providerId: "commandcode", baseUrl: "https://api.commandcode.ai/provider/v1", credentialRef: "COMMAND_CODE_API_KEY", anonymousCatalog: true, anonymousChat: false, category: "paid" },
+
+	// --- Added after live credential probing (2026-09-17) ---------------------
+	// Each verified: /models answered 200 with a real chat catalog.
+	{ providerId: "openrouter", baseUrl: "https://openrouter.ai/api/v1", credentialRef: "OPENROUTER_FREE_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
+	{ providerId: "nvidia", baseUrl: "https://integrate.api.nvidia.com/v1", credentialRef: "NVIDIA_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
+	{ providerId: "gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", credentialRef: "GEMINI_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
+	{ providerId: "zai", baseUrl: "https://api.z.ai/api/paas/v4", credentialRef: "ZAI_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
+	{ providerId: "orcarouter", baseUrl: "https://api.orcarouter.ai/v1", credentialRef: "ORCAROUTER_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
+	{ providerId: "tium", baseUrl: "https://api.tium.ai/v1", credentialRef: "TIUM_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
 ];
 
 export function seedById(providerId: string): ProviderSeed | undefined {

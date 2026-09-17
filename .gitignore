@@ -5,5 +5,10 @@ dist/
 *.db-wal
 *.db-shm
 .env
-.DS_Store
+.env.*
+*.env
+secrets.*
+# Runtime state: the agent sandbox and SQLite store are created at run time.
+.pi-swarm-workspace/
+.pi-swarm.db*
 coverage/

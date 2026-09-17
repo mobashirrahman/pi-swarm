@@ -42,6 +42,13 @@ export interface AccountRegistryEntry extends ProviderAccount {
 	baseUrl: string;
 	/** For anonymous accounts: the only tier reachable without a key. */
 	anonymousTier?: string | undefined;
+	/**
+	 * Declared provider category. Drives the free-only policy when a catalog
+	 * exposes no pricing: a paid provider's unpriced models must NOT be treated
+	 * as free (OpenAI's /models lists no prices, so the pricing heuristic alone
+	 * would happily route to paid models).
+	 */
+	category?: "free" | "freemium" | "paid" | undefined;
 }
 
 /** In-memory account registry. Persistence arrives with the store layer. */
