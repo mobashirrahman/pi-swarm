@@ -8,9 +8,74 @@ Built on the patterns proven in [pi-free](https://github.com/apmantza/pi-free)
 (quota-header parsing, failure classification, TTL+strikes blacklisting),
 generalized from "rescue one session" to "schedule N concurrent agents".
 
+## Install
+
+Requires **Node.js 22.12+** (`node:sqlite` is built in — no native deps, no
+build step on the user's machine).
+
+**OpenCode** — add to `opencode.json` (project root or
+`~/.config/opencode/opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "swarm": {
+      "type": "local",
+      "command": ["npx", "-y", "pi-swarm-mcp"],
+      "timeout": 60000
+    }
+  }
+}
+```
+
+**Claude Code** — one command:
+
+```bash
+claude mcp add swarm -- npx -y pi-swarm-mcp
+```
+
+**Oh My Pi / Cursor / VS Code** (`mcpServers` shape):
+
+```json
+{
+  "mcpServers": {
+    "swarm": {
+      "command": "npx",
+      "args": ["-y", "pi-swarm-mcp"]
+    }
+  }
+}
+```
+
+No configuration is required: state defaults to `.pi-swarm.db` and
+`.pi-swarm-workspace/` in the working directory. For provider keys, put them
+in one secrets file and point at it (values never leave the process):
+
+```bash
+# ~/.pi-swarm.env
+LLM7_API_KEY=...
+```
+
+```json
+{ "environment": { "PI_SWARM_ENV_FILE": "/absolute/path/to/.pi-swarm.env" } }
+```
+
+Without keys the swarm runs on the anonymous tier where available (degraded —
+expect 401 churn on some models). Check the binary starts (exits 0 on EOF):
+
+```bash
+npx -y pi-swarm-mcp < /dev/null; echo "exit: $?"
+```
+
+Prefer running from source? Clone the repo and substitute
+`npx -y pi-swarm-mcp` with `npx tsx /path/to/pi-swarm/src/mcp-server.ts`
+(run from the repo so `tsx` resolves). Maintainers should use the release
+check and tagged workflow described in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
 ## Status
 
-**All phases of the plan are implemented and verified.** 113 tests green.
+**All phases of the plan are implemented and verified.** 162 tests green.
 
 | Phase | Scope | State |
 | --- | --- | --- |
@@ -166,7 +231,8 @@ Key decisions (full rationale in the plan doc):
 ## Using it inside Oh My Pi / OpenCode
 
 pi-swarm is an **MCP server**, so MCP-capable agents get it as native tools
-(`mcp__swarm_spawn`, `mcp__swarm_wait`, …). Full guide:
+(`mcp__swarm_spawn`, `mcp__swarm_wait`, …). Install from npm — no clone
+needed (see [Install](#install)). Full guide:
 [`docs/using-in-agents.md`](docs/using-in-agents.md).
 
 **Oh My Pi** — `.omp/mcp.json` (project) or `~/.omp/agent/mcp.json` (user):
@@ -176,7 +242,7 @@ pi-swarm is an **MCP server**, so MCP-capable agents get it as native tools
   "mcpServers": {
     "swarm": {
       "command": "npx",
-      "args": ["tsx", "/path/to/pi-swarm/src/mcp-server.ts"]
+      "args": ["-y", "pi-swarm-mcp"]
     }
   }
 }
@@ -190,7 +256,8 @@ serve both):
   "mcp": {
     "swarm": {
       "type": "local",
-      "command": ["npx", "tsx", "/path/to/pi-swarm/src/mcp-server.ts"]
+      "command": ["npx", "-y", "pi-swarm-mcp"],
+      "timeout": 60000
     }
   }
 }
@@ -198,7 +265,8 @@ serve both):
 
 Two backends: **embedded** (default — the MCP server runs the swarm
 in-process, no daemon) or **proxy** (`PI_SWARM_URL=http://localhost:7463` to
-share one swarm across sessions). Verify the wiring with:
+share one swarm across sessions). From a source checkout, verify the wiring
+with:
 
 ```bash
 npx tsx scripts/mcp-client-demo.ts "What is 12*12? Answer with just the number."
@@ -219,11 +287,15 @@ curl -X POST localhost:7463/v1/agents -H 'Content-Type: application/json' \
        "qualityFloor":null,"allowUnknownQuality":true},
        "idempotencyKey":"unique-key"}'
 
-# status / cancel / capacity / events
+# status / cancel / capacity / events / recovery
 curl localhost:7463/v1/agents/<id>
 curl -X DELETE localhost:7463/v1/agents/<id>
 curl localhost:7463/v1/capacity
 curl -N localhost:7463/v1/agents/<id>/events        # SSE; ?since=<seq> resumes
+# after a credential rotation or a false-positive trip (no restart needed):
+curl -X POST localhost:7463/v1/capacity/reset -H 'Content-Type: application/json' \
+  -d '{"accountId":"llm7:primary"}'
+# MCP equivalent: swarm_reset (omit accountId to reset all)
 ```
 
 Accounts resolve credentials from env (`LLM7_API_KEY`, `CLINE_API_KEY`,

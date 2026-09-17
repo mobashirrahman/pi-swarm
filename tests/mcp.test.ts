@@ -37,11 +37,12 @@ describe("MCP protocol contract", () => {
 		const result = (await handleMessage(fakeBackend() as never, rpc("initialize"))) as {
 			protocolVersion: string;
 			capabilities: { tools: unknown };
-			serverInfo: { name: string };
+			serverInfo: { name: string; version: string };
 		};
 		expect(result.protocolVersion).toBe("2024-11-05");
 		expect(result.capabilities.tools).toBeDefined();
 		expect(result.serverInfo.name).toBe("pi-swarm");
+		expect(result.serverInfo.version).toBe("1.0.0");
 	});
 
 	it("notifications produce no response", async () => {

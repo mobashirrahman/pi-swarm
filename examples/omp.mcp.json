@@ -3,14 +3,11 @@
 		"swarm": {
 			"command": "npx",
 			"args": [
-				"tsx",
-				"/Users/mobashirrahman/Documents/pi-swarm/src/mcp-server.ts"
+				"-y",
+				"pi-swarm-mcp"
 			],
 			"env": {
-				"PI_SWARM_DB": "/Users/mobashirrahman/Documents/pi-swarm/.pi-swarm.db",
-				"PI_SWARM_WORKSPACE": "/Users/mobashirrahman/Documents/pi-swarm/.pi-swarm-workspace",
-				"LLM7_API_KEY": "${LLM7_API_KEY:-}",
-				"PI_SWARM_ENV_FILE": "/path/to/pi-swarm/secrets.env"
+				"PI_SWARM_ENV_FILE": "${PI_SWARM_ENV_FILE:-${HOME}/.pi-swarm.env}"
 			},
 			"timeout": 120000
 		}

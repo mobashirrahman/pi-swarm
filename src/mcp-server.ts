@@ -27,7 +27,7 @@ import { pathToFileURL } from "node:url";
 import type { AgentSpec } from "./agent.ts";
 
 const SERVER_NAME = "pi-swarm";
-const SERVER_VERSION = "0.1.0";
+const SERVER_VERSION = "1.0.0";
 const PROTOCOL_VERSION = "2024-11-05";
 /**
  * Default `swarm_wait` budget. MUST stay under the MCP client's request
