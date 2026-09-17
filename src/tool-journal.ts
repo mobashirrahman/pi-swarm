@@ -32,7 +32,12 @@ export interface ToolJournalEntry {
 }
 
 export interface ToolJournal {
-	begin(id: string, tool: string, argsJson: string, now: number): void;
+	/**
+	 * Atomically claim an execution id. Returns true only for the worker that
+	 * owns the side effect. A completed or in-flight id is never overwritten;
+	 * a failed id may be claimed for a deliberate retry.
+	 */
+	begin(id: string, tool: string, argsJson: string, now: number): boolean;
 	/** Mark finished; resultJson required for "completed". */
 	complete(id: string, resultJson: string, now: number): void;
 	fail(id: string, errorClass: string, now: number): void;
@@ -49,10 +54,15 @@ export interface ToolJournal {
 export class InMemoryToolJournal implements ToolJournal {
 	private readonly entries = new Map<string, ToolJournalEntry>();
 
-	begin(id: string, tool: string, argsJson: string, now: number): void {
+	begin(id: string, tool: string, argsJson: string, now: number): boolean {
 		const existing = this.entries.get(id);
-		if (existing && existing.status === "completed") return; // keep the replay source
+		if (existing?.status === "failed") {
+			this.entries.set(id, { id, tool, argsJson, status: "running", startedAt: now });
+			return true;
+		}
+		if (existing) return false;
 		this.entries.set(id, { id, tool, argsJson, status: "running", startedAt: now });
+		return true;
 	}
 
 	complete(id: string, resultJson: string, now: number): void {
@@ -99,7 +109,8 @@ export function toolExecutionId(agentId: string, turnIndex: number, callId: stri
  * AgentStore); kept as an interface so tests can use in-memory doubles.
  */
 export interface ToolJournalStore {
-	toolBegin(id: string, tool: string, argsJson: string, now: number): void;
+	/** Atomically inserts a new id or claims a previously failed id. */
+	toolBegin(id: string, tool: string, argsJson: string, now: number): boolean;
 	toolComplete(id: string, resultJson: string, now: number): void;
 	toolFail(id: string, errorClass: string, now: number): void;
 	toolLookup(id: string): { status: "running" | "completed" | "failed"; resultJson?: string | undefined } | undefined;
@@ -109,10 +120,11 @@ export interface ToolJournalStore {
 export class PersistentToolJournal implements ToolJournal {
 	constructor(private readonly store: ToolJournalStore) {}
 
-	begin(id: string, tool: string, argsJson: string, now: number): void {
-		const prior = this.store.toolLookup(id);
-		if (prior?.status === "completed") return; // keep the replay source
-		this.store.toolBegin(id, tool, argsJson, now);
+	begin(id: string, tool: string, argsJson: string, now: number): boolean {
+		// The store performs this as one SQLite statement/transaction boundary;
+		// a lookup followed by an insert would re-open the duplicate-side-effect
+		// race across worker processes.
+		return this.store.toolBegin(id, tool, argsJson, now);
 	}
 
 	complete(id: string, resultJson: string, now: number): void {

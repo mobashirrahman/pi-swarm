@@ -91,8 +91,13 @@ export class ToolExecutor {
 			return JSON.stringify({ error: "invalid_arguments", detail: "arguments are not valid JSON" });
 		}
 
-		this.journal.begin(id, tool, argsJson, Date.now());
-
+		// Claim the id atomically. A lookup followed by an unconditional begin
+		// lets two workers execute the same side effect at once.
+		if (!this.journal.begin(id, tool, argsJson, Date.now())) {
+			const current = this.journal.lookup(id);
+			if (current?.status === "completed" && current.resultJson !== undefined) return current.resultJson;
+			return JSON.stringify({ error: "uncertain_state", detail: "another worker owns this execution or its outcome is unknown; refusing to duplicate a side effect" });
+		}
 		// Timeout wrapper: per-call controller linked to the agent signal.
 		const controller = new AbortController();
 		const abortFromUpstream = () => controller.abort(signal.reason);

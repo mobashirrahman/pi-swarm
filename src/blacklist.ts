@@ -63,7 +63,7 @@ export class Blacklist {
 	recordFailure(key: string, reason: string, now: number): BlacklistEntry {
 		const existing = this.entries.get(key);
 		const effectiveTtl = Math.min(this.ttlFor(reason), this.ttlFor(existing?.reasons[0] ?? reason));
-		if (existing && now - existing.windowStart > effectiveTtl) {
+		if (existing && now - existing.lastFailureAt > effectiveTtl) {
 			// TTL window expired — reset the streak.
 			this.entries.delete(key);
 		}
@@ -91,6 +91,22 @@ export class Blacklist {
 	}
 
 	/**
+	 * Clear every entry scoped to one account ("accountId/modelId" keys).
+	 * Used by administrative capacity resets; per-model TTL expiry still
+	 * handles the normal case. Returns how many were cleared.
+	 */
+	clearAccount(accountId: string): number {
+		let n = 0;
+		for (const key of this.entries.keys()) {
+			if (key === accountId || key.startsWith(`${accountId}/`)) {
+				this.entries.delete(key);
+				n += 1;
+			}
+		}
+		return n;
+	}
+
+	/**
 	 * Blacklisted right now? Hard ban (>= maxStrikes) persists for the
 	 * session; soft ban must still be inside the class TTL window.
 	 */
@@ -99,7 +115,13 @@ export class Blacklist {
 		if (!entry) return false;
 		if (entry.count >= this.maxStrikes) return true;
 		const effectiveTtl = Math.min(this.ttlFor(entry.reasons[0] ?? ""), this.ttlFor(entry.reasons[entry.reasons.length - 1] ?? ""));
-		return now - entry.windowStart <= effectiveTtl;
+		if (now - entry.lastFailureAt > effectiveTtl) {
+			// Expiry is also eviction: dynamic catalogs can produce many
+			// transient model keys, so stale soft bans must not grow forever.
+			this.entries.delete(key);
+			return false;
+		}
+		return true;
 	}
 
 	/** Read-only snapshot for /capacity or history views. */

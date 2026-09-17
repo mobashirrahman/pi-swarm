@@ -47,6 +47,7 @@ export interface AgentEvents {
 	onTurnCommitted?: ((turnIndex: number, content: string) => void) | undefined;
 	onToolResults?: ((turnIndex: number, count: number) => void) | undefined;
 	onReroute?: ((turnIndex: number, from: string, to: string, reason: string) => void) | undefined;
+	onCancel?: (() => void) | undefined;
 	onComplete?: ((finalContent: string) => void) | undefined;
 	onFail?: ((reason: string) => void) | undefined;
 }
@@ -73,6 +74,7 @@ export class AgentRuntime {
 	private readonly deadline: number;
 	/** Loop guard: signature + count of consecutive identical tool turns. */
 	private lastToolSignature = "";
+	private cancelNotified = false;
 	private repeatedToolTurns = 0;
 
 	constructor(
@@ -89,7 +91,13 @@ export class AgentRuntime {
 					maxAttempts: number;
 					signal: AbortSignal;
 				},
-			) => Promise<{ ok: true; outcome: Extract<TurnOutcome, { ok: true }>; accountId: string; modelId: string } | { ok: false; reason: string }>;
+			) => Promise<{
+				ok: true;
+				outcome: Extract<TurnOutcome, { ok: true }>;
+				accountId: string;
+				modelId: string;
+				reroutedFrom?: { accountId: string; modelId: string; reason: string } | undefined;
+			} | { ok: false; reason: string }>;
 		},
 		private readonly toolExecutor: {
 			execute: (agentId: string, turnIndex: number, callId: string, tool: string, argsJson: string, signal: AbortSignal) => Promise<string>;
@@ -111,6 +119,7 @@ export class AgentRuntime {
 		if (this.isTerminal(this.state)) return;
 		this.abortController.abort();
 		this.transition("cancelled");
+		this.notifyCancel();
 	}
 
 	private isTerminal(state: AgentState): boolean {
@@ -119,6 +128,10 @@ export class AgentRuntime {
 
 	private transition(next: AgentState): void {
 		if (this.state === next) return;
+		// Cancellation is sticky: once cancelled, no other terminal (or
+		// running) state may overwrite it, or a turn finishing after cancel()
+		// would silently lose the cancellation.
+		if (this.state === "cancelled" && next !== "cancelled") return;
 		this.state = next;
 		this.events.onStateChange?.(next, this.spec.agentId);
 	}
@@ -139,6 +152,7 @@ export class AgentRuntime {
 		for (let turn = 0; turn < this.spec.maxTurns; turn++) {
 			if (this.abortController.signal.aborted) return this.abortFinal();
 			if (Date.now() > this.deadline) {
+				this.abortController.abort();
 				this.transition("failed");
 				this.events.onFail?.("wall_time_exceeded");
 				throw new Error("wall time exceeded");
@@ -154,12 +168,23 @@ export class AgentRuntime {
 				maxAttempts: this.spec.maxProviderAttemptsPerTurn,
 				signal: this.abortController.signal,
 			});
+			// Cancellation wins even if a dispatcher resolves successfully after
+			// the upstream abort signal fired.
+			if (this.abortController.signal.aborted) return this.abortFinal();
 
 			if (!result.ok) {
 				if (this.abortController.signal.aborted) return this.abortFinal();
 				this.transition("failed");
 				this.events.onFail?.(result.reason);
 				throw new Error(result.reason);
+			}
+			if (result.reroutedFrom) {
+				this.events.onReroute?.(
+					turn,
+					`${result.reroutedFrom.accountId}/${result.reroutedFrom.modelId}`,
+					`${result.accountId}/${result.modelId}`,
+					result.reroutedFrom.reason,
+				);
 			}
 
 			// Commit: staged output is now durable in the transcript.
@@ -210,6 +235,9 @@ export class AgentRuntime {
 			this.events.onToolResults?.(turn, result.outcome.toolCalls.length);
 		}
 
+		// Stop in-flight work: without aborting, a dispatcher call or tool
+		// execution keeps burning quota after the agent is declared dead.
+		this.abortController.abort();
 		this.transition("failed");
 		this.events.onFail?.("max_turns_exceeded");
 		throw new Error("max turns exceeded");
@@ -217,6 +245,13 @@ export class AgentRuntime {
 
 	private abortFinal(): string {
 		this.transition("cancelled");
+		this.notifyCancel();
 		return "";
+	}
+
+	private notifyCancel(): void {
+		if (this.cancelNotified) return;
+		this.cancelNotified = true;
+		this.events.onCancel?.();
 	}
 }

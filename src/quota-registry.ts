@@ -4,8 +4,8 @@
  *
  * Design (from the plan):
  *  - A turn is admissible only when EVERY applicable bucket can reserve.
- *  - Unknown quota does NOT mean unlimited: a cold bucket admits exactly one
- *    probation request, then locks onto observed/configured values.
+ *  - Unknown quota does NOT mean unlimited: a cold bucket admits only its
+ *    configured number of concurrent probation requests until observed.
  *  - Dispatch reserves BEFORE the request is sent (local decrement closes the
  *    gap between spawning N agents and responses arriving).
  *  - After the response, reservations reconcile against actual usage and the
@@ -55,8 +55,8 @@ export interface ReserveRequest {
 
 export interface QuotaRegistryOptions {
 	/**
-	 * How many requests an UNKNOWN account bucket may admit during probation.
-	 * The plan fixes this at 1 — the first response reveals real limits.
+	 * How many concurrent requests an UNKNOWN account bucket may admit during
+	 * probation. The default is 1 to cap cold-start bursts.
 	 */
 	probationRequests?: number;
 }
@@ -256,15 +256,19 @@ export class QuotaRegistry {
 		if (!reservation) return;
 		this.reservations.delete(reservationId);
 		if (!reservation.sent) {
-			// Un-sent: undo the charge on every bucket.
+			// Un-sent: undo the charge on every bucket, capped at the limit so
+			// a refund can never inflate `remaining` above what the provider
+			// actually allows (a fractional or duplicated refund would
+			// otherwise over-admit later requests).
 			for (const key of reservation.keys) {
 				const bucket = this.buckets.get(key);
 				if (!bucket) continue;
 				if (bucket.remaining !== undefined && bucket.limit !== undefined) {
-					bucket.remaining = Math.min(bucket.limit, bucket.remaining + 1);
-				}
-				if (bucket.metric === "tokens" && bucket.remaining !== undefined) {
-					bucket.remaining = bucket.remaining + reservation.estimatedTokens;
+					if (bucket.metric === "requests") {
+						bucket.remaining = Math.min(bucket.limit, bucket.remaining + 1);
+					} else {
+						bucket.remaining = Math.min(bucket.limit, bucket.remaining + reservation.estimatedTokens);
+					}
 				}
 			}
 		}
@@ -294,19 +298,29 @@ export class QuotaRegistry {
 		});
 	}
 
+
 	/**
-	 * Find the first bucket that cannot admit. Unknown buckets admit exactly
-	 * `probationRequests` lifetime requests; expired windows reset.
+	 * Find the first bucket that cannot admit. Unknown buckets allow only
+	 * `probationRequests` concurrent reservations until a provider reports a
+	 * real quota. This caps a cold-start burst without deadlocking providers
+	 * that never publish quota headers.
 	 */
 	private findBlocking(
 		applicable: Array<{ key: string; bucket: QuotaBucket }>,
 		estimatedTokens: number,
 		now: number,
 	): { key: string; bucket: QuotaBucket } | undefined {
+		// Lazy creation gives us account/day and token buckets even when a
+		// provider only publishes one quota family. Once any bucket is known,
+		// those still-unknown siblings are not evidence of an active limit and
+		// must not turn a configured request quota into a one-request account.
+		const hasKnownBucket = applicable.some(({ bucket }) => bucket.confidence !== "unknown");
 		for (const { key, bucket } of applicable) {
 			if (this.expired(bucket, now)) continue; // window rolled over
 			if (bucket.confidence === "unknown") {
-				// Probation: allow while NO confirmed limit exists.
+				if (hasKnownBucket) continue;
+				const active = this.activeReservationsFor(key);
+				if (active >= this.probationRequests) return { key, bucket };
 				continue;
 			}
 			if (bucket.metric === "requests" && bucket.remaining !== undefined && bucket.remaining < 1) {
@@ -317,6 +331,14 @@ export class QuotaRegistry {
 			}
 		}
 		return undefined;
+	}
+
+	private activeReservationsFor(key: string): number {
+		let count = 0;
+		for (const reservation of this.reservations.values()) {
+			if (reservation.keys.includes(key)) count += 1;
+		}
+		return count;
 	}
 
 	/** Charge a bucket (pre-checked by findBlocking). */
@@ -337,10 +359,6 @@ export class QuotaRegistry {
 			bucket.remaining = bucket.remaining === undefined ? undefined : bucket.remaining - requests;
 		} else {
 			bucket.remaining = bucket.remaining === undefined ? undefined : bucket.remaining - tokens;
-		}
-		// Unknown buckets count lifetime probation admissions.
-		if (bucket.confidence === "unknown") {
-			bucket.observedAt = now;
 		}
 	}
 
@@ -381,7 +399,7 @@ export class QuotaRegistry {
 		const counters = this.responseCounters(accountId);
 		if (status === 401) counters.authFailures += 1;
 		else if (status === 403) counters.policyFailures += 1;
-		else if (status === 429) counters.rateLimited += 1;
+		else if (status === 402 || status === 429) counters.rateLimited += 1;
 		else if (status >= 500 && status < 600) counters.serverErrors += 1;
 		if (hadDrift) counters.quotaHeaderDrift += 1;
 	}

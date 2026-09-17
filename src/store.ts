@@ -7,6 +7,8 @@
  */
 
 import { DatabaseSync } from "node:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
 import type { AgentSpec, AgentState } from "./agent.ts";
 
 export interface AgentRow {
@@ -35,6 +37,9 @@ export class AgentStore {
 	private readonly db: DatabaseSync;
 
 	constructor(path: string) {
+		// The DB path may point into a directory that does not exist yet
+		// (e.g. a fresh ~/.pi-swarm). SQLite will not create parents.
+		if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
 		this.db = new DatabaseSync(path);
 		// busy_timeout FIRST: several worker processes share this file, and
 		// switching to WAL itself takes a lock — without a timeout the second
@@ -94,10 +99,18 @@ export class AgentStore {
 				args_json TEXT NOT NULL,
 				status TEXT NOT NULL,
 				result_json TEXT,
+				error_class TEXT,
 				started_at INTEGER NOT NULL,
 				finished_at INTEGER
 			);
 		`);
+		// Older databases were created before tool failures stored their class.
+		// Upgrade them in place so a persistent tool failure cannot crash the
+		// journal writer on the first UPDATE.
+		const toolColumns = this.db.prepare("PRAGMA table_info(tool_journal)").all() as Array<{ name: string }>;
+		if (!toolColumns.some((column) => column.name === "error_class")) {
+			this.db.exec("ALTER TABLE tool_journal ADD COLUMN error_class TEXT");
+		}
 	}
 
 	// =========================================================================
@@ -222,11 +235,19 @@ export class AgentStore {
 	// Tool journal persistence (side-effect safety across restarts)
 	// =========================================================================
 
-	/** Record a tool execution's begin event. */
-	toolBegin(id: string, tool: string, argsJson: string, now: number): void {
-		this.db
-			.prepare("INSERT OR REPLACE INTO tool_journal (id, tool, args_json, status, started_at) VALUES (?, ?, ?, 'running', ?)")
+	/** Atomically claim a tool execution id. */
+	toolBegin(id: string, tool: string, argsJson: string, now: number): boolean {
+		const inserted = this.db
+			.prepare("INSERT INTO tool_journal (id, tool, args_json, status, started_at) VALUES (?, ?, ?, 'running', ?) ON CONFLICT(id) DO NOTHING")
 			.run(id, tool, argsJson, now);
+		if (Number(inserted.changes ?? 0) === 1) return true;
+
+		// A failed tool is safe to retry, but the transition must still be
+		// conditional so concurrent retries cannot both acquire the side effect.
+		const retried = this.db
+			.prepare("UPDATE tool_journal SET tool = ?, args_json = ?, status = 'running', result_json = NULL, error_class = NULL, started_at = ?, finished_at = NULL WHERE id = ? AND status = 'failed'")
+			.run(tool, argsJson, now, id);
+		return Number(retried.changes ?? 0) === 1;
 	}
 
 	toolComplete(id: string, resultJson: string, now: number): void {

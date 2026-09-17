@@ -99,6 +99,22 @@ async function* sseChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<stri
 	const reader = body.getReader();
 	const decoder = new TextDecoder();
 	let buffer = "";
+	let dataLines: string[] = [];
+	const flushEvent = (): string | undefined => {
+		if (dataLines.length === 0) return undefined;
+		const payload = dataLines.join("\n");
+		dataLines = [];
+		return payload;
+	};
+	const consumeLine = (line: string): string | undefined => {
+		if (line === "") return flushEvent();
+		if (!line.startsWith("data:")) return undefined;
+		// The SSE spec makes the space after the field name OPTIONAL:
+		// `data:{...}` is valid and some gateways emit it without the space.
+		const payload = line.startsWith("data: ") ? line.slice(6) : line.slice(5);
+		dataLines.push(payload);
+		return undefined;
+	};
 	try {
 		for (;;) {
 			const { done, value } = await reader.read();
@@ -108,9 +124,21 @@ async function* sseChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<stri
 			while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
 				const line = buffer.slice(0, newlineIndex).replace(/\r$/, "");
 				buffer = buffer.slice(newlineIndex + 1);
-				if (line.startsWith("data: ")) yield line.slice(6);
+				const payload = consumeLine(line);
+				if (payload !== undefined) yield payload;
 			}
 		}
+		// Flush the decoder's trailing bytes — a partial UTF-8 sequence at the
+		// end of the stream would otherwise be lost or mangled.
+		buffer += decoder.decode();
+		// Flush a final line/event when the provider omits the trailing blank
+		// line. Consecutive data fields are joined per the SSE specification.
+		if (buffer.length > 0) {
+			const payload = consumeLine(buffer.replace(/\r$/, ""));
+			if (payload !== undefined) yield payload;
+		}
+		const payload = flushEvent();
+		if (payload !== undefined) yield payload;
 	} finally {
 		reader.releaseLock();
 	}

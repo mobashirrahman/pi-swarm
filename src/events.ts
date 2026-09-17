@@ -57,7 +57,9 @@ export class EventBus {
 		if (ring.length > MAX_EVENTS_PER_AGENT) ring.splice(0, ring.length - MAX_EVENTS_PER_AGENT);
 		this.history.set(agentId, ring);
 
-		for (const listener of this.listeners.get(agentId) ?? []) {
+		// Snapshot: a listener that unsubscribes mid-emit mutates the underlying
+		// Set while it is being iterated, which skips live listeners.
+		for (const listener of [...(this.listeners.get(agentId) ?? [])]) {
 			// A listener must never break the emitting path (agent progress
 			// cannot depend on a consumer's health).
 			try {

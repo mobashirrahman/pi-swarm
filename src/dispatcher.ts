@@ -364,7 +364,13 @@ export class Dispatcher {
 			signal: AbortSignal;
 		},
 		tools?: ReadonlyArray<ToolSpec>,
-	): Promise<{ ok: true; outcome: Extract<TurnOutcome, { ok: true }>; accountId: string; modelId: string } | { ok: false; reason: string }> {
+	): Promise<{
+		ok: true;
+		outcome: Extract<TurnOutcome, { ok: true }>;
+		accountId: string;
+		modelId: string;
+		reroutedFrom?: { accountId: string; modelId: string; reason: string } | undefined;
+	} | { ok: false; reason: string }> {
 		const excludeAccounts = new Set<string>();
 		/** "accountId/modelId" pairs excluded this turn (model-scoped reroute). */
 		const excludeModels = new Set<string>();
@@ -383,6 +389,7 @@ export class Dispatcher {
 		 */
 		let quotaWaits = 0;
 		const MAX_QUOTA_WAITS = 20;
+		let lastFailedRoute: { accountId: string; modelId: string; reason: string } | undefined;
 		while (attempt <= opts.maxAttempts + quotaWaits && quotaWaits <= MAX_QUOTA_WAITS) {
 			if (opts.signal.aborted) return { ok: false, reason: "aborted" };
 			const now = Date.now();
@@ -530,6 +537,7 @@ export class Dispatcher {
 					this.quota.commit(reservationId, outcome.usage?.totalTokens ?? 0);
 					this.releaseLease(activeLease);
 					this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, "empty_response", Date.now());
+					lastFailedRoute = { accountId: candidate.accountId, modelId: candidate.modelId, reason: "empty_response" };
 					excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
 					this.recordHealth(candidate, outcome.latencyMs, false);
 					_logger.info("empty_response_reroute", {
@@ -547,7 +555,9 @@ export class Dispatcher {
 				this.circuit.recordSuccess(candidate.accountId);
 				this.blacklist.clear(`${candidate.accountId}/${candidate.modelId}`);
 				this.recordHealth(candidate, outcome.latencyMs, true, outcome.timing);
-				return { ok: true, outcome, accountId: candidate.accountId, modelId: candidate.modelId };
+				const from = lastFailedRoute;
+				const reroutedFrom = from && (from.accountId !== candidate.accountId || from.modelId !== candidate.modelId) ? from : undefined;
+				return { ok: true, outcome, accountId: candidate.accountId, modelId: candidate.modelId, ...(reroutedFrom ? { reroutedFrom } : {}) };
 			}
 
 			// --- Failure path: charge the sent reservation, classify, decide.
@@ -583,6 +593,7 @@ export class Dispatcher {
 				// (quota headers, Retry-After, or repeated failures across
 				// DIFFERENT models of the same account).
 				this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, cls, Date.now());
+				lastFailedRoute = { accountId: candidate.accountId, modelId: candidate.modelId, reason: cls };
 				// NOTE: deliberately NOT added to excludeModels. excludeModels is
 				// a permanent per-turn exclusion, which made a 429'd model
 				// unretryable for the whole turn even after its quota window
@@ -620,6 +631,7 @@ export class Dispatcher {
 		if (cls === "auth" || cls === "policy") {
 			const modelKey = `${candidate.accountId}/${candidate.modelId}`;
 			this.blacklist.recordFailure(modelKey, cls, Date.now());
+			lastFailedRoute = { accountId: candidate.accountId, modelId: candidate.modelId, reason: cls };
 			if (cls === "auth" && !resolveKey(account)) this.anonModelBans.add(modelKey);
 			excludeModels.add(modelKey);
 
@@ -645,6 +657,7 @@ export class Dispatcher {
 				// exhaust and the turn still fails, so a genuinely broken
 				// request is not masked.
 				this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, "no_tool_support", Date.now());
+				lastFailedRoute = { accountId: candidate.accountId, modelId: candidate.modelId, reason: "bad_request" };
 				excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
 				_logger.info("tool_unsupported_reroute", {
 					agentId: opts.agentId,
@@ -663,6 +676,7 @@ export class Dispatcher {
 				// 656 candidates were available). The model is excluded for the
 				// rest of the turn; the account stays eligible.
 				this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, cls, Date.now());
+				lastFailedRoute = { accountId: candidate.accountId, modelId: candidate.modelId, reason: "model_gone" };
 				excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
 				_logger.info("model_gone_reroute", {
 					agentId: opts.agentId,

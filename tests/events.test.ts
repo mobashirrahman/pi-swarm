@@ -45,6 +45,16 @@ describe("event bus", () => {
 		expect(() => bus.emit("a", "agent.started")).not.toThrow();
 		expect(seen).toEqual(["agent.started"]);
 	});
+	it("snapshots listeners so one unsubscribe cannot skip another listener", () => {
+		const bus = new EventBus();
+		const seen: string[] = [];
+		let second: { unsubscribe(): void } | undefined;
+		bus.subscribe("a", () => second?.unsubscribe());
+		second = bus.subscribe("a", () => seen.push("second"));
+		bus.emit("a", "agent.started");
+		expect(seen).toEqual(["second"]);
+		expect(bus.subscriberCount("a")).toBe(1);
+	});
 
 	it("eventsSince supports SSE resume by sequence", () => {
 		const bus = new EventBus();

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { InMemoryToolJournal, PersistentToolJournal, toolExecutionId } from "../src/tool-journal.ts";
+import { AgentStore } from "../src/store.ts";
 import { ToolExecutor, evalArithmetic, registerBuiltinTools } from "../src/tools.ts";
 
 const NO_SIGNAL = new AbortController().signal;
@@ -80,6 +81,28 @@ describe("tool journal: idempotency contract", () => {
 		const second = await executor.execute("a1", 0, "c", "flaky", "{}", NO_SIGNAL);
 		expect(JSON.parse(second)).toEqual({ ok: true });
 		expect(attempts).toBe(2);
+	});
+	it("atomically refuses a concurrent duplicate side effect", async () => {
+		const journal = new InMemoryToolJournal();
+		const executor = new ToolExecutor({ journal });
+		let executions = 0;
+		const gate = Promise.withResolvers<string>();
+		executor.register("side_effect", {
+			description: "side effect",
+			parameters: { type: "object", properties: {} },
+			execute: async () => {
+				executions += 1;
+				return gate.promise;
+			},
+		});
+
+		const first = executor.execute("a1", 0, "same-call", "side_effect", "{}", NO_SIGNAL);
+		await Promise.resolve();
+		const second = await executor.execute("a1", 0, "same-call", "side_effect", "{}", NO_SIGNAL);
+		expect(JSON.parse(second).error).toBe("uncertain_state");
+		gate.resolve("committed");
+		expect(await first).toBe("committed");
+		expect(executions).toBe(1);
 	});
 });
 
@@ -175,9 +198,17 @@ describe("persistent journal adapter", () => {
 	it("maps a running row to uncertain and passes through completed results", () => {
 		const rows = new Map<string, { status: "running" | "completed" | "failed"; resultJson?: string | undefined }>();
 		const store = {
-			toolBegin: (id: string) => rows.set(id, { status: "running" }),
-			toolComplete: (id: string, resultJson: string) => rows.set(id, { status: "completed", resultJson }),
-			toolFail: (id: string) => rows.set(id, { status: "failed" }),
+			toolBegin: (id: string) => {
+				if (rows.has(id)) return false;
+				rows.set(id, { status: "running" });
+				return true;
+			},
+			toolComplete: (id: string, resultJson: string) => {
+				rows.set(id, { status: "completed", resultJson });
+			},
+			toolFail: (id: string) => {
+				rows.set(id, { status: "failed" });
+			},
 			toolLookup: (id: string) => rows.get(id),
 		};
 		const journal = new PersistentToolJournal(store);
@@ -190,9 +221,17 @@ describe("persistent journal adapter", () => {
 	it("begin() does not clobber a completed record", () => {
 		const rows = new Map<string, { status: "running" | "completed" | "failed"; resultJson?: string | undefined }>();
 		const store = {
-			toolBegin: (id: string) => rows.set(id, { status: "running" }),
-			toolComplete: (id: string, resultJson: string) => rows.set(id, { status: "completed", resultJson }),
-			toolFail: (id: string) => rows.set(id, { status: "failed" }),
+			toolBegin: (id: string) => {
+				if (rows.has(id)) return false;
+				rows.set(id, { status: "running" });
+				return true;
+			},
+			toolComplete: (id: string, resultJson: string) => {
+				rows.set(id, { status: "completed", resultJson });
+			},
+			toolFail: (id: string) => {
+				rows.set(id, { status: "failed" });
+			},
 			toolLookup: (id: string) => rows.get(id),
 		};
 		const journal = new PersistentToolJournal(store);
@@ -200,5 +239,50 @@ describe("persistent journal adapter", () => {
 		journal.complete("a:0:c", "result", 2);
 		journal.begin("a:0:c", "t", "{}", 3);
 		expect(journal.lookup("a:0:c")?.status).toBe("completed");
+	});
+	it("SQLite journal claims a duplicate side effect across executor instances", async () => {
+		const store = new AgentStore(":memory:");
+		try {
+			const gate = Promise.withResolvers<string>();
+			let executions = 0;
+			const first = new ToolExecutor({ journal: new PersistentToolJournal(store) });
+			const second = new ToolExecutor({ journal: new PersistentToolJournal(store) });
+			const implementation = {
+				description: "side effect",
+				parameters: { type: "object", properties: {} },
+				execute: async () => {
+					executions += 1;
+					return gate.promise;
+				},
+			};
+			first.register("side_effect", implementation);
+			second.register("side_effect", implementation);
+
+			const pending = first.execute("a1", 0, "shared", "side_effect", "{}", NO_SIGNAL);
+			await Promise.resolve();
+			const duplicate = await second.execute("a1", 0, "shared", "side_effect", "{}", NO_SIGNAL);
+			expect(JSON.parse(duplicate).error).toBe("uncertain_state");
+			gate.resolve("committed");
+			expect(await pending).toBe("committed");
+			expect(executions).toBe(1);
+		} finally {
+			store.close();
+		}
+	});
+	it("persists failed tool outcomes without a missing-column error", async () => {
+		const store = new AgentStore(":memory:");
+		try {
+			const executor = new ToolExecutor({ journal: new PersistentToolJournal(store) });
+			executor.register("fails", {
+				description: "fails",
+				parameters: { type: "object", properties: {} },
+				execute: async () => { throw new Error("expected"); },
+			});
+			const result = await executor.execute("a1", 0, "failed", "fails", "{}", NO_SIGNAL);
+			expect(JSON.parse(result).error).toBe("tool_failed");
+			expect(store.toolLookup("a1:0:failed")?.status).toBe("failed");
+		} finally {
+			store.close();
+		}
 	});
 });

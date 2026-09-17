@@ -4,13 +4,15 @@ import { QuotaRegistry } from "../src/quota-registry.ts";
 const NOW = 1_000_000;
 
 describe("QuotaRegistry reservation semantics", () => {
-	it("unknown buckets admit one probation request and report unlimited headroom", () => {
+	it("unknown buckets cap concurrent probation requests", () => {
 		const qr = new QuotaRegistry();
 		const first = qr.tryReserve({ accountId: "a", estimatedTokens: 100 }, NOW);
 		expect(first.ok).toBe(true);
-		// Probation continues until an observation lands (unknown = no cap).
 		const second = qr.tryReserve({ accountId: "a", estimatedTokens: 100 }, NOW);
-		expect(second.ok).toBe(true);
+		expect(second.ok).toBe(false);
+		expect(second.blockedBy).toContain("requests/minute");
+		qr.release(first.reservation!.id);
+		expect(qr.tryReserve({ accountId: "a", estimatedTokens: 100 }, NOW).ok).toBe(true);
 	});
 
 	it("configured buckets block when exhausted and report reset time", () => {
@@ -85,14 +87,27 @@ describe("QuotaRegistry reservation semantics", () => {
 		expect(qr.tryReserve({ accountId: "a", estimatedTokens: 10 }, NOW, 1).ok).toBe(true);
 	});
 
-	it("records per-account outcome counters including drift", () => {
+	it("records per-account outcome counters including quota payment failures and drift", () => {
 		const qr = new QuotaRegistry();
 		qr.recordOutcome("a", 429, false);
+		qr.recordOutcome("a", 402, false);
 		qr.recordOutcome("a", 401, false);
 		qr.recordOutcome("a", 0, true);
 		const counters = qr.responseCounters("a");
-		expect(counters.rateLimited).toBe(1);
+		expect(counters.rateLimited).toBe(2);
 		expect(counters.authFailures).toBe(1);
 		expect(counters.quotaHeaderDrift).toBe(1);
+	});
+
+	it("caps unsent refunds at the observed bucket limit", () => {
+		const qr = new QuotaRegistry();
+		qr.configureBucket("a", "tokens", "minute", 100, { windowMs: 60_000, now: NOW });
+		const reservation = qr.tryReserve({ accountId: "a", estimatedTokens: 20 }, NOW);
+		expect(reservation.ok).toBe(true);
+		// A newer observation may refill the bucket before the old unsent
+		// reservation is released; the refund must not create 120 tokens.
+		qr.observe("a", "tokens", "minute", 100, 100, { resetAt: NOW + 60_000 });
+		qr.release(reservation.reservation!.id);
+		expect(qr.getBucket("a|account|tokens/minute")?.remaining).toBe(100);
 	});
 });

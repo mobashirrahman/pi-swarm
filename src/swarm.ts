@@ -234,6 +234,17 @@ export class SwarmService {
 						});
 					}
 				},
+				onReroute: (turnIndex, from, to, reason) => {
+					this.events.emit(spec.agentId, "turn.rerouted", { turn: turnIndex, from, to, reason });
+				},
+				onCancel: () => {
+					this.events.emit(spec.agentId, "agent.cancelled");
+					if (this.store) {
+						const row = this.store.getAgent(spec.agentId);
+						if (row) this.store.upsertAgent({ ...row, state: "cancelled", updatedAt: Date.now() });
+					}
+					this.tree.unregister(spec.agentId);
+				},
 				onComplete: (content) => {
 					this.events.emit(spec.agentId, "agent.completed", { chars: content.length });
 					if (this.store) {
@@ -280,7 +291,6 @@ export class SwarmService {
 
 	cancelAgent(agentId: string): boolean {
 		const cancelled = this.tree.cancelTree(agentId);
-		for (const id of cancelled) this.events.emit(id, "agent.cancelled");
 		return cancelled.length > 0;
 	}
 

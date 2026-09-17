@@ -57,10 +57,12 @@ const TOKEN_PAIRS: ReadonlyArray<HeaderPair> = [
 ];
 
 /** Parse a numeric header; returns undefined for missing/invalid. */
+// Quota gauges are non-negative integers. Number() accepts exponent notation
+// while rejecting trailing garbage that parseFloat() would silently accept.
 function parseNumber(raw: string | undefined): number | undefined {
 	if (raw === undefined) return undefined;
-	const value = Number.parseFloat(raw);
-	return Number.isFinite(value) ? value : undefined;
+	const value = Number(raw.trim());
+	return Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined;
 }
 
 /**

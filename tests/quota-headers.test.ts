@@ -75,4 +75,17 @@ describe("quota header extraction", () => {
 		);
 		expect(result.quotas).toHaveLength(0);
 	});
+	it("floors fractional gauges and rejects negative or malformed values", () => {
+		const fractional = extractQuotaHeaders(
+			{ "x-ratelimit-remaining": "0.9", "x-ratelimit-limit": "10.9" },
+			"acct",
+		);
+		expect(fractional.quotas[0]).toMatchObject({ remaining: 0, limit: 10 });
+
+		const invalid = extractQuotaHeaders(
+			{ "x-ratelimit-remaining": "-1", "x-ratelimit-limit": "10oops" },
+			"acct",
+		);
+		expect(invalid.quotas).toHaveLength(0);
+	});
 });

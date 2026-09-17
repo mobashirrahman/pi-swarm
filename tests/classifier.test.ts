@@ -7,9 +7,10 @@ describe("classifier (ported from pi-free auto-fallback)", () => {
 		expect(classifyStatus(402)).toEqual({ kind: "recoverable", cls: "quota" });
 	});
 
-	it("maps auth/policy/model-gone to unrecoverable", () => {
+	it("maps auth/policy/legal/model-gone to unrecoverable", () => {
 		expect(classifyStatus(401).cls).toBe("auth");
 		expect(classifyStatus(403).cls).toBe("policy");
+		expect(classifyStatus(451).cls).toBe("policy");
 		expect(classifyStatus(404).cls).toBe("model_gone");
 		expect(classifyStatus(400).cls).toBe("bad_request");
 	});

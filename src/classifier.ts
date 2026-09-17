@@ -36,7 +36,7 @@ export const UNRECOVERABLE_HTTP_STATUSES: ReadonlySet<number> = new Set([
 /** Map an HTTP status to a coarse class for circuit/blacklist decisions. */
 export function classifyStatus(status: number): { kind: FailureKind; cls: FailureClass } {
 	if (status === 401) return { kind: "unrecoverable", cls: "auth" };
-	if (status === 403) return { kind: "unrecoverable", cls: "policy" };
+	if (status === 403 || status === 451) return { kind: "unrecoverable", cls: "policy" };
 	if (status === 402 || status === 429) return { kind: "recoverable", cls: "quota" };
 	if (status === 404 || status === 410) return { kind: "unrecoverable", cls: "model_gone" };
 	if (RECOVERABLE_HTTP_STATUSES.has(status)) return { kind: "recoverable", cls: "server" };
