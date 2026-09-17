@@ -351,6 +351,22 @@ export class Dispatcher {
 					await sleep(2_000);
 					continue; // does NOT consume an attempt
 				}
+				// Distinguish the two empty-pool cases: a transient gap that
+				// outlived the deadline means every provider was rate-limited or
+				// cooling down (report capacity_exhausted, with the circuits that
+				// blocked), while a pool with no transient gap is genuinely
+				// unusable (all models hard-banned or disabled). The generic
+				// "no_eligible_candidate" hid this from operators.
+				if (transientGap) {
+					const cooling = [...ctx.circuitOpen];
+					_logger.info("capacity_exhausted", {
+						agentId: opts.agentId,
+						turn: opts.turnIndex,
+						coolingAccounts: cooling,
+						waitedMs: 240_000 - Math.max(0, this.turnDeadline - Date.now()),
+					});
+					return { ok: false, reason: "capacity_exhausted" };
+				}
 				return { ok: false, reason: "no_eligible_candidate" };
 			}
 			const { candidate } = selection.best;
