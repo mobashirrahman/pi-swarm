@@ -158,7 +158,13 @@ export class SwarmService {
 			{
 				executeTurn: async (messages, opts) => {
 					this.events.emit(spec.agentId, "turn.routed", { turn: opts.turnIndex });
-					const result = await this.dispatcher.executeTurn(messages, opts, this.toolExecutor?.specs());
+					// Advertise tools ONLY when the agent asked for them. Sending
+					// them unconditionally made chatty models call a tool for
+					// trivial prompts, burning turns until maxTurns (observed
+					// live: "what is 8*8" failed with max_turns_exceeded after
+					// two tool calls). A text-only agent should just answer.
+					const tools = spec.capabilities.includes("tools") ? this.toolExecutor?.specs() : undefined;
+					const result = await this.dispatcher.executeTurn(messages, opts, tools);
 					if (this.store && result.ok) {
 						this.store.recordAttempt({
 							attemptId: `${opts.agentId}:${opts.turnIndex}:${result.accountId}`,
