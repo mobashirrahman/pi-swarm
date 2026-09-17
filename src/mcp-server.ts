@@ -22,6 +22,8 @@ import { Workspace } from "./workspace.ts";
 import { SqliteLeaseStore } from "./leases.ts";
 import { recoverInterrupted } from "./recovery.ts";
 import { loadConfiguredEnvFile } from "./env-file.ts";
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import type { AgentSpec } from "./agent.ts";
 
 const SERVER_NAME = "pi-swarm";
@@ -117,6 +119,29 @@ const TOOLS: ToolDefinition[] = [
 		description: "Show per-account provider capacity: circuit state, in-flight turns, and remaining quota where known.",
 		inputSchema: { type: "object", properties: {} },
 	},
+	{
+		name: "swarm_models",
+		description:
+			"Inspect the routing view: every routable model with the signals that decide selection — intelligence score, measured latency/TTFT/tokens-per-second, success rate, sample count, and account circuit state. Use this to see which backends the swarm will pick and why.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				limit: { type: "number", description: "Return only the top N candidates (default: all)." },
+				accountId: { type: "string", description: "Filter to one account, e.g. \"nvidia:primary\"." },
+			},
+		},
+	},
+	{
+		name: "swarm_reset",
+		description:
+			"Administrative capacity reset: close circuits and clear model bans for one account (or all when omitted). Recovers the pool after a credential rotation or a false-positive trip without restarting.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				accountId: { type: "string", description: "Reset only this account (default: all accounts)." },
+			},
+		},
+	},
 ];
 
 // =============================================================================
@@ -128,6 +153,8 @@ interface SwarmBackend {
 	status(agentId: string): Promise<{ state: string; finalContent?: string | undefined; failReason?: string | undefined; events: string[] }>;
 	cancel(agentId: string): Promise<boolean>;
 	capacity(): Promise<unknown>;
+	models(args: Record<string, unknown>): Promise<unknown>;
+	reset(args: Record<string, unknown>): Promise<unknown>;
 }
 
 /** In-process swarm (no daemon required). */
@@ -170,6 +197,19 @@ class EmbeddedBackend implements SwarmBackend {
 	async capacity(): Promise<unknown> {
 		return this.service.capacity();
 	}
+
+	async models(args: Record<string, unknown>): Promise<unknown> {
+		const limit = args["limit"] !== undefined ? Number(args["limit"]) : undefined;
+		const accountId = args["accountId"] !== undefined ? String(args["accountId"]) : undefined;
+		let rows = this.service.routingView(limit !== undefined && Number.isFinite(limit) ? { limit } : {});
+		if (accountId !== undefined) rows = rows.filter((row) => row.accountId === accountId);
+		return { models: rows };
+	}
+
+	async reset(args: Record<string, unknown>): Promise<unknown> {
+		const accountId = args["accountId"] !== undefined ? String(args["accountId"]) : undefined;
+		return this.service.resetCapacity(accountId);
+	}
 }
 
 /** Proxy to a running pi-swarm HTTP server (PI_SWARM_URL). */
@@ -211,6 +251,24 @@ class HttpBackend implements SwarmBackend {
 
 	async capacity(): Promise<unknown> {
 		const response = await fetch(`${this.baseUrl}/v1/capacity`);
+		return await response.json();
+	}
+
+	async models(args: Record<string, unknown>): Promise<unknown> {
+		const params = new URLSearchParams();
+		if (args["limit"] !== undefined) params.set("limit", String(Number(args["limit"])));
+		if (args["accountId"] !== undefined) params.set("accountId", String(args["accountId"]));
+		const query = params.size > 0 ? `?${params.toString()}` : "";
+		const response = await fetch(`${this.baseUrl}/v1/models${query}`);
+		return await response.json();
+	}
+
+	async reset(args: Record<string, unknown>): Promise<unknown> {
+		const response = await fetch(`${this.baseUrl}/v1/capacity/reset`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ accountId: args["accountId"] }),
+		});
 		return await response.json();
 	}
 }
@@ -275,6 +333,12 @@ async function callTool(backend: SwarmBackend, name: string, args: Record<string
 		}
 		case "swarm_capacity": {
 			return JSON.stringify(await backend.capacity());
+		}
+		case "swarm_models": {
+			return JSON.stringify(await backend.models(args));
+		}
+		case "swarm_reset": {
+			return JSON.stringify(await backend.reset(args));
 		}
 		default:
 			throw new Error(`unknown tool: ${name}`);
@@ -379,6 +443,17 @@ export async function runServer(): Promise<void> {
 }
 
 // Only run the loop when executed as a program (imported in tests otherwise).
-if (import.meta.url === `file://${process.argv[1]}`) {
+// The realpath comparison matters: package managers invoke the binary through
+// a symlink (node_modules/.bin), while import.meta.url is already resolved.
+function isMainModule(): boolean {
+	try {
+		const invoked = process.argv[1];
+		return !!invoked && import.meta.url === pathToFileURL(realpathSync(invoked)).href;
+	} catch {
+		return false;
+	}
+}
+
+if (isMainModule()) {
 	await runServer();
 }

@@ -47,6 +47,32 @@ export interface TurnUsage {
 	totalTokens: number;
 }
 
+/**
+ * Speed measurements for one turn. These are the INTERNAL benchmark: what this
+ * deployment actually observes, as opposed to what a vendor publishes.
+ */
+export interface TurnTiming {
+	/** Total wall time of the turn. */
+	latencyMs: number;
+	/** Request sent → first content token. The dominant UX cost. */
+	ttftMs: number | undefined;
+	/** Output tokens per second, measured over the streaming window. */
+	tokensPerSecond: number | undefined;
+}
+
+/**
+ * Minimum streaming interval before a tokens/sec figure is meaningful; below
+ * this the denominator is noise.
+ */
+const MIN_STREAM_WINDOW_MS = 200;
+
+/**
+ * Ceiling for a believable generation rate. No hosted model streams anywhere
+ * near this; a larger figure means the provider's `completion_tokens` counted
+ * tokens that never appeared in the visible stream.
+ */
+const MAX_PLAUSIBLE_TOKENS_PER_SECOND = 1_000;
+
 export type TurnOutcome =
 	| {
 			ok: true;
@@ -57,6 +83,8 @@ export type TurnOutcome =
 			usage: TurnUsage | undefined;
 			quota: HeaderParseResult;
 			latencyMs: number;
+			/** Internal speed measurements for routing. */
+			timing: TurnTiming;
 	  }
 	| {
 			ok: false;
@@ -176,6 +204,11 @@ export async function streamTurn(request: TurnRequest): Promise<TurnOutcome> {
 	const toolCallMap = new Map<number, { id: string; name: string; arguments: string }>();
 	let usage: TurnUsage | undefined;
 	let sawFinish = false;
+	// Internal speed measurements: first content token, and the window over
+	// which output actually streamed (so tokens/sec reflects generation, not
+	// queueing before the first token).
+	let firstTokenAt: number | undefined;
+	let lastTokenAt: number | undefined;
 
 	try {
 		for await (const data of sseChunks(response.body)) {
@@ -187,7 +220,12 @@ export async function streamTurn(request: TurnRequest): Promise<TurnOutcome> {
 				continue; // malformed chunk — skip, stream continues
 			}
 			const choice = parsed.choices?.[0];
-			if (choice?.delta?.content) content += choice.delta.content;
+			if (choice?.delta?.content) {
+				content += choice.delta.content;
+				const now = Date.now();
+				firstTokenAt ??= now;
+				lastTokenAt = now;
+			}
 			const toolDeltas = choice?.delta?.tool_calls;
 			if (toolDeltas) {
 				for (const delta of toolDeltas) {
@@ -234,5 +272,23 @@ export async function streamTurn(request: TurnRequest): Promise<TurnOutcome> {
 			: undefined,
 	};
 
-	return { ok: true, message, content, toolCalls, usage, quota, latencyMs };
+	// Throughput over the streaming window only, and only when the measurement is
+	// physically plausible. Two guards, both needed:
+	//   - window: a rate needs a real streaming interval to divide by.
+	//   - ceiling: gateways report completion_tokens that can include reasoning
+	//     or cached tokens, so a short visible answer can imply tens of
+	//     thousands of tokens/sec (measured live: 25,708 tps). An impossible
+	//     rate would win every routing tie-break, so it is treated as
+	//     unmeasured rather than recorded.
+	const streamWindowMs = firstTokenAt !== undefined && lastTokenAt !== undefined ? lastTokenAt - firstTokenAt : 0;
+	const completionTokens = usage?.completionTokens ?? 0;
+	const rawRate = completionTokens > 0 && streamWindowMs >= MIN_STREAM_WINDOW_MS ? (completionTokens / streamWindowMs) * 1000 : undefined;
+	const tokensPerSecond = rawRate !== undefined && rawRate <= MAX_PLAUSIBLE_TOKENS_PER_SECOND ? Math.round(rawRate) : undefined;
+	const timing: TurnTiming = {
+		latencyMs,
+		ttftMs: firstTokenAt !== undefined ? firstTokenAt - startedAt : undefined,
+		tokensPerSecond,
+	};
+
+	return { ok: true, message, content, toolCalls, usage, quota, latencyMs, timing };
 }

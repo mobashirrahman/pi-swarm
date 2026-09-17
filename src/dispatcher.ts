@@ -20,6 +20,8 @@ import { selectTurnCandidate, type SelectorContext, type TurnRequirements } from
 import { streamTurn, type ChatMessage, type ToolSpec, type TurnOutcome } from "./stream.ts";
 import { fetchCatalog, resolveKey, wireModelIsChat, wireModelIsFree, type AccountRegistry, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
 import { computeRetryBackoffMs, sleep } from "./fetch.ts";
+import { lookupModelScore } from "./benchmarks.ts";
+import type { TelemetryStore } from "./telemetry.ts";
 import type { LeaseStore, TurnLease } from "./leases.ts";
 import type { HeaderQuota } from "./quota-headers.ts";
 import type { Candidate } from "./types.ts";
@@ -66,6 +68,12 @@ export interface DispatcherOptions {
 	 * this is far shorter than the session TTL for other failures.
 	 */
 	quotaBlacklistTtlMs?: number;
+	/**
+	 * Persisted internal performance telemetry (TTFT, tokens/sec, latency).
+	 * When present it supersedes the in-memory health map, so routing survives
+	 * restarts and is shared across worker processes.
+	 */
+	telemetry?: TelemetryStore | undefined;
 }
 
 interface ModelHealth {
@@ -78,6 +86,21 @@ interface ModelHealth {
 const EWMA_ALPHA = 0.3;
 const UNPROVEN_LATENCY_MS = 30_000;
 
+/**
+ * Wall-clock bound for one turn's capacity waits (transient gaps,
+ * concurrency pressure, lease contention). Passed per-call — never shared
+ * mutable state, so one agent's turn cannot extend another's wait.
+ */
+const TURN_WAIT_BUDGET_MS = 240_000;
+
+/**
+ * Bounded cooldown when a KEYED credential is rejected across models.
+ * Previously Number.MAX_SAFE_INTEGER (a permanent, unrecoverable pool death
+ * with no operator reset). Keys get rotated and anonymous-tier entitlements
+ * flap per model, so the account must re-admit after a bounded window.
+ */
+const CREDENTIAL_COOLDOWN_MS = 10 * 60_000;
+
 export class Dispatcher {
 	readonly quota: QuotaRegistry;
 	readonly blacklist: Blacklist;
@@ -89,6 +112,7 @@ export class Dispatcher {
 	private readonly leases: LeaseStore | undefined;
 	private readonly leaseTtlMs: number;
 	private readonly quotaBackoffBaseMs: number;
+	private readonly telemetry: TelemetryStore | undefined;
 	/** "accountId/modelId" → health. */
 	private readonly health = new Map<string, ModelHealth>();
 	/** providerId → accounts. */
@@ -111,6 +135,7 @@ export class Dispatcher {
 		this.leases = options.leases;
 		this.leaseTtlMs = options.leaseTtlMs ?? 5 * 60 * 1000;
 		this.quotaBackoffBaseMs = options.quotaBackoffBaseMs ?? 5_000;
+		this.telemetry = options.telemetry;
 		for (const account of this.accounts.all()) {
 			const list = this.accountsByProvider.get(account.providerId) ?? [];
 			list.push(account);
@@ -159,13 +184,20 @@ export class Dispatcher {
 			});
 			const visible = freeModels.length > 0 ? freeModels : unpricedMeansFree ? usable : [];
 			for (const model of visible) {
+				// Real intelligence score. `undefined` stays null = UNSCORED,
+				// which the selector treats as its own quality band rather than
+				// as a low score.
+				const score = lookupModelScore(model.id, model.name);
+				const quality = score?.codingIndex ?? score?.intelligenceIndex;
 				candidates.push({
 					accountId: account.accountId,
 					providerId: account.providerId,
 					modelId: model.id,
 					name: model.name ?? model.id,
-					ciScore: null, // CI lookup lands with the benchmark port
-					contextWindow: model.context_length ?? 0,
+					ciScore: quality ?? null,
+					// Prefer the measured/benchmarked window when the provider
+					// catalog does not publish one.
+					contextWindow: model.context_length ?? score?.contextWindow ?? 0,
 					capabilities: { text: true, vision: false, tools: true },
 				});
 			}
@@ -181,6 +213,11 @@ export class Dispatcher {
 			counts.set(candidate.accountId, (counts.get(candidate.accountId) ?? 0) + 1);
 		}
 		return counts;
+	}
+
+	/** The routable candidate set (scored), for the routing view. */
+	candidates(): ReadonlyArray<Candidate> {
+		return this.getCandidates();
 	}
 
 	private getCandidates(): Candidate[] {
@@ -252,14 +289,12 @@ export class Dispatcher {
 			remainingRequests,
 			ewmaLatencyMs: this.latencyMap(),
 			successRate: this.successRateMap(),
+			tokensPerSecond: this.telemetry?.throughputMap(),
 			blacklisted,
 			circuitOpen,
 			estimatedTokens,
 		};
 	}
-
-	/** Wall-clock deadline for one executeTurn call (set at entry). */
-	private turnDeadline = 0;
 
 	/**
 	 * Is the empty selection caused by something that heals on its own?
@@ -290,18 +325,20 @@ export class Dispatcher {
 	}
 
 	private latencyMap(): Map<string, number> {
-		const map = new Map<string, number>();
+		// Prefer persisted telemetry (shared across processes and restarts); the
+		// in-memory map remains for turns observed before a store existed.
+		const map = this.telemetry?.latencyMap() ?? new Map<string, number>();
 		for (const [key, health] of this.health) {
-			if (health.samples > 0) map.set(key, health.latencyEwmaMs);
+			if (health.samples > 0 && !map.has(key)) map.set(key, health.latencyEwmaMs);
 		}
 		return map;
 	}
 
 	private successRateMap(): Map<string, number> {
-		const map = new Map<string, number>();
+		const map = this.telemetry?.successRateMap() ?? new Map<string, number>();
 		for (const [key, health] of this.health) {
 			const total = health.successes + health.failures;
-			map.set(key, total === 0 ? 0 : health.successes / total);
+			if (total > 0 && !map.has(key)) map.set(key, health.successes / total);
 		}
 		return map;
 	}
@@ -332,7 +369,9 @@ export class Dispatcher {
 		/** "accountId/modelId" pairs excluded this turn (model-scoped reroute). */
 		const excludeModels = new Set<string>();
 		const estimatedTokens = estimateTokens(messages) + this.defaultMaxOutputTokens;
-		this.turnDeadline = Date.now() + 240_000; // transient-gap wait bound
+		// Per-turn wait bound as a LOCAL: a shared field let one agent's turn
+		// extend (or shrink) every other concurrent turn's wait (observed live).
+		const turnDeadline = Date.now() + TURN_WAIT_BUDGET_MS;
 
 		let attempt = 1;
 		/**
@@ -366,7 +405,7 @@ export class Dispatcher {
 				// wait and re-select WITHOUT burning an attempt — backpressure
 				// is the exhaustion contract (acceptance #3).
 				const transientGap = selection.concurrencyBlocked || this.hasTransientGap(ctx);
-				if (transientGap && Date.now() < this.turnDeadline) {
+				if (transientGap && Date.now() < turnDeadline) {
 					await sleep(2_000);
 					continue; // does NOT consume an attempt
 				}
@@ -382,7 +421,7 @@ export class Dispatcher {
 						agentId: opts.agentId,
 						turn: opts.turnIndex,
 						coolingAccounts: cooling,
-						waitedMs: 240_000 - Math.max(0, this.turnDeadline - Date.now()),
+						waitedMs: TURN_WAIT_BUDGET_MS - Math.max(0, turnDeadline - Date.now()),
 					});
 					return { ok: false, reason: "capacity_exhausted" };
 				}
@@ -402,7 +441,7 @@ export class Dispatcher {
 				// the predicted release instead of failing the turn. Does not
 				// consume an attempt — the request was never sent.
 				const blockKey = reservation.blockedBy ?? "";
-				if (blockKey.endsWith("concurrency") && Date.now() < this.turnDeadline) {
+				if (blockKey.endsWith("concurrency") && Date.now() < turnDeadline) {
 					await sleep(2_000);
 					continue; // capacity returns on its own; keep candidate eligible
 				}
@@ -426,7 +465,7 @@ export class Dispatcher {
 			}) ?? null;
 			if (this.leases && lease === null) {
 				this.quota.release(reservationId);
-				if (Date.now() < this.turnDeadline) {
+				if (Date.now() < turnDeadline) {
 					await sleep(2_000);
 					continue; // does NOT consume an attempt
 				}
@@ -450,18 +489,36 @@ export class Dispatcher {
 
 			if (outcome.ok) {
 				// Fence check: if another worker took this account's capacity
-				// while we streamed (our lease expired and was re-issued), the
-				// work is stale — do not commit it against someone else's slot.
+				// while we streamed (our lease expired and was re-issued), try
+				// to re-acquire once — capacity may be free again, in which
+				// case the work commits under a fresh fence instead of being
+				// thrown away. Only when re-acquire fails is the work stale.
+				let activeLease = lease;
 				if (this.leases && lease && !this.leases.validate(lease)) {
-					this.quota.release(reservationId);
 					this.leases.release(lease.leaseId);
-					_logger.info("stale_lease_rejected", {
+					const renewed = this.leases.acquire({
+						accountId: candidate.accountId,
+						agentId: opts.agentId,
+						turnIndex: opts.turnIndex,
+						maxConcurrency: account.maxConcurrency || this.defaultMaxConcurrency,
+						ttlMs: this.leaseTtlMs,
+					});
+					if (!renewed) {
+						this.quota.release(reservationId);
+						_logger.info("stale_lease_rejected", {
+							agentId: opts.agentId,
+							account: candidate.accountId,
+							token: lease.fencingToken,
+						});
+						excludeAccounts.add(candidate.accountId);
+						continue;
+					}
+					activeLease = renewed;
+					_logger.info("stale_lease_renewed", {
 						agentId: opts.agentId,
 						account: candidate.accountId,
-						token: lease.fencingToken,
+						token: renewed.fencingToken,
 					});
-					excludeAccounts.add(candidate.accountId);
-					continue;
 				}
 				// Model-defect guard: a 200 with neither content nor tool calls
 				// is not an answer. Reasoning-only models (llm7's GLM returns
@@ -471,7 +528,7 @@ export class Dispatcher {
 				// reroute — a different model may answer properly.
 				if (outcome.content.trim().length === 0 && outcome.toolCalls.length === 0) {
 					this.quota.commit(reservationId, outcome.usage?.totalTokens ?? 0);
-					this.releaseLease(lease);
+					this.releaseLease(activeLease);
 					this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, "empty_response", Date.now());
 					excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
 					this.recordHealth(candidate, outcome.latencyMs, false);
@@ -486,10 +543,10 @@ export class Dispatcher {
 					continue;
 				}
 				this.quota.commit(reservationId, outcome.usage?.totalTokens ?? 0);
-				this.releaseLease(lease);
+				this.releaseLease(activeLease);
 				this.circuit.recordSuccess(candidate.accountId);
 				this.blacklist.clear(`${candidate.accountId}/${candidate.modelId}`);
-				this.recordHealth(candidate, outcome.latencyMs, true);
+				this.recordHealth(candidate, outcome.latencyMs, true, outcome.timing);
 				return { ok: true, outcome, accountId: candidate.accountId, modelId: candidate.modelId };
 			}
 
@@ -566,21 +623,8 @@ export class Dispatcher {
 			if (cls === "auth" && !resolveKey(account)) this.anonModelBans.add(modelKey);
 			excludeModels.add(modelKey);
 
-			let distinctCredentialFailures = 0;
-			for (const key of this.blacklist.snapshot().keys()) {
-				if (!key.startsWith(`${candidate.accountId}/`)) continue;
-				const entry = this.blacklist.snapshot().get(key);
-				if (entry?.reasons.some((reason) => reason === "auth" || reason === "policy")) distinctCredentialFailures += 1;
-			}
-			if (distinctCredentialFailures >= 2) {
-				// Multiple models rejected: the credential itself is bad.
-				this.circuit.openUntil(candidate.accountId, Number.MAX_SAFE_INTEGER, Date.now());
+			if (this.maybeCoolDownCredentials(account, opts.agentId)) {
 				excludeAccounts.add(candidate.accountId);
-				_logger.info("account_disabled_credentials", {
-					agentId: opts.agentId,
-					account: candidate.accountId,
-					distinctModels: distinctCredentialFailures,
-				});
 			}
 			_logger.info("credential_scoped_reroute", {
 				agentId: opts.agentId,
@@ -644,6 +688,50 @@ export class Dispatcher {
 		return this.leases?.activeFor(accountId) ?? [];
 	}
 
+	/**
+	 * Administrative reset for one account: close the circuit and clear its
+	 * model bans, so the account is routable again after a credential
+	 * rotation or a false-positive trip. Returns blacklist entries cleared.
+	 */
+	resetAccount(accountId: string): { clearedBans: number } {
+		this.circuit.reset(accountId);
+		const clearedBans = this.blacklist.clearAccount(accountId);
+		for (const key of [...this.anonModelBans]) {
+			if (key === accountId || key.startsWith(`${accountId}/`)) this.anonModelBans.delete(key);
+		}
+		return { clearedBans };
+	}
+
+	/**
+	 * Credential-failure trip decision (auth/policy branch). Counts DISTINCT
+	 * models on the account with auth/policy strikes; a KEYED credential
+	 * rejected across ≥2 models is itself bad, so the account takes a
+	 * BOUNDED cooldown (keys rotate; the pool must heal). Anonymous accounts
+	 * never trip: with no key there is no credential to be bad, and per-model
+	 * bans plus reroute already cover entitlement flapping. Returns true when
+	 * the account was cooled down.
+	 */
+	maybeCoolDownCredentials(account: AccountRegistryEntry, agentId: string): boolean {
+		let distinctCredentialFailures = 0;
+		for (const key of this.blacklist.snapshot().keys()) {
+			if (!key.startsWith(`${account.accountId}/`)) continue;
+			const entry = this.blacklist.snapshot().get(key);
+			if (entry?.reasons.some((reason) => reason === "auth" || reason === "policy")) distinctCredentialFailures += 1;
+		}
+		if (distinctCredentialFailures >= 2 && resolveKey(account)) {
+			const now = Date.now();
+			this.circuit.openUntil(account.accountId, now + CREDENTIAL_COOLDOWN_MS, now);
+			_logger.info("account_disabled_credentials", {
+				agentId,
+				account: account.accountId,
+				distinctModels: distinctCredentialFailures,
+				cooldownMs: CREDENTIAL_COOLDOWN_MS,
+			});
+			return true;
+		}
+		return false;
+	}
+
 	private applyQuotaObservation(
 		accountId: string,
 		quota: { quotas: HeaderQuota[]; drift: boolean; retryAfterMs?: number },
@@ -659,8 +747,20 @@ export class Dispatcher {
 		}
 	}
 
-	private recordHealth(candidate: Candidate, latencyMs: number, success: boolean): void {
+	private recordHealth(candidate: Candidate, latencyMs: number, success: boolean, timing?: { ttftMs?: number | undefined; tokensPerSecond?: number | undefined }): void {
 		const key = `${candidate.accountId}/${candidate.modelId}`;
+
+		// Persisted internal benchmark: shared across processes and restarts.
+		if (success) {
+			this.telemetry?.recordSuccess(candidate.accountId, candidate.modelId, {
+				latencyMs,
+				ttftMs: timing?.ttftMs,
+				tokensPerSecond: timing?.tokensPerSecond,
+			});
+		} else {
+			this.telemetry?.recordFailure(candidate.accountId, candidate.modelId);
+		}
+
 		let health = this.health.get(key);
 		if (!health) {
 			health = { latencyEwmaMs: UNPROVEN_LATENCY_MS, samples: 0, successes: 0, failures: 0 };

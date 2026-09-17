@@ -12,6 +12,8 @@ interface FakeBackend {
 	status(agentId: string): Promise<{ state: string; finalContent?: string | undefined; failReason?: string | undefined; events: string[] }>;
 	cancel(agentId: string): Promise<boolean>;
 	capacity(): Promise<unknown>;
+	models(args: Record<string, unknown>): Promise<unknown>;
+	reset(args: Record<string, unknown>): Promise<unknown>;
 }
 
 function fakeBackend(overrides: Partial<FakeBackend> = {}): FakeBackend {
@@ -20,6 +22,8 @@ function fakeBackend(overrides: Partial<FakeBackend> = {}): FakeBackend {
 		status: async () => ({ state: "completed", finalContent: "42", events: ["agent.queued", "agent.completed"] }),
 		cancel: async () => true,
 		capacity: async () => [{ accountId: "fake:primary", circuit: "closed" }],
+		models: async () => [{ accountId: "fake:primary", modelId: "m1", quality: 71.5, tokensPerSecond: 40 }],
+		reset: async () => ({ reset: ["fake:primary"], clearedBans: 0 }),
 		...overrides,
 	};
 }
@@ -53,7 +57,7 @@ describe("MCP protocol contract", () => {
 			tools: Array<{ name: string; description: string; inputSchema: { type: string; required?: string[] } }>;
 		};
 		const names = result.tools.map((tool) => tool.name);
-		expect(names).toEqual(["swarm_spawn", "swarm_wait", "swarm_status", "swarm_cancel", "swarm_capacity"]);
+		expect(names).toEqual(["swarm_spawn", "swarm_wait", "swarm_status", "swarm_cancel", "swarm_capacity", "swarm_models", "swarm_reset"]);
 		for (const tool of result.tools) {
 			expect(tool.description.length).toBeGreaterThan(10);
 			expect(tool.inputSchema.type).toBe("object");
@@ -126,6 +130,22 @@ describe("MCP protocol contract", () => {
 		)) as { content: Array<{ text: string }>; isError: boolean };
 		expect(result.isError).toBe(true);
 		expect(JSON.parse(result.content[0]!.text).error).toContain("provider exploded");
+	});
+
+	it("swarm_models and swarm_reset dispatch to the backend", async () => {
+		const models = (await handleMessage(
+			fakeBackend() as never,
+			rpc("tools/call", { name: "swarm_models", arguments: { limit: 5 } }),
+		)) as { content: Array<{ text: string }> };
+		expect(JSON.parse(models.content[0]!.text)).toEqual([
+			{ accountId: "fake:primary", modelId: "m1", quality: 71.5, tokensPerSecond: 40 },
+		]);
+
+		const reset = (await handleMessage(
+			fakeBackend() as never,
+			rpc("tools/call", { name: "swarm_reset", arguments: { accountId: "fake:primary" } }),
+		)) as { content: Array<{ text: string }> };
+		expect(JSON.parse(reset.content[0]!.text)).toEqual({ reset: ["fake:primary"], clearedBans: 0 });
 	});
 
 	it("unknown methods raise so the loop can answer with an error frame", async () => {

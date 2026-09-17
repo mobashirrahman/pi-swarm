@@ -5,10 +5,13 @@
  *   GET  /v1/agents/:id        status + transcript
  *   DELETE /v1/agents/:id      cancel
  *   GET  /v1/capacity          per-account quota/circuit view
+ *   POST /v1/capacity/reset    close circuits + clear model bans (recovery)
  */
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { join } from "node:path";
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { AgentStore } from "./store.ts";
 import { SwarmService } from "./swarm.ts";
 import { SqliteLeaseStore } from "./leases.ts";
@@ -138,6 +141,21 @@ async function main(): Promise<number> {
 				sendJson(res, 200, { accounts: service.capacity() });
 				return;
 			}
+			if (req.method === "POST" && url.pathname === "/v1/capacity/reset") {
+				const body = JSON.parse(await readBody(req).catch(() => "{}")) as { accountId?: unknown };
+				const accountId = typeof body.accountId === "string" ? body.accountId : undefined;
+				sendJson(res, 200, service.resetCapacity(accountId));
+				return;
+			}
+			if (req.method === "GET" && url.pathname === "/v1/models") {
+				// The routing view: what decides which backend serves a turn.
+				const limitRaw = url.searchParams.get("limit");
+				const accountId = url.searchParams.get("accountId");
+				let rows = service.routingView(limitRaw !== null ? { limit: Number.parseInt(limitRaw, 10) } : {});
+				if (accountId !== null) rows = rows.filter((row) => row.accountId === accountId);
+				sendJson(res, 200, { models: rows });
+				return;
+			}
 			sendJson(res, 404, { error: "not_found" });
 		} catch (error) {
 			_logger.error("request_failed", {
@@ -154,4 +172,18 @@ async function main(): Promise<number> {
 	return 0;
 }
 
-process.exitCode = await main();
+// Only listen when executed as a program (imported in tests otherwise).
+// The realpath comparison matters: package managers invoke the binary through
+// a symlink (node_modules/.bin), while import.meta.url is already resolved.
+function isMainModule(): boolean {
+	try {
+		const invoked = process.argv[1];
+		return !!invoked && import.meta.url === pathToFileURL(realpathSync(invoked)).href;
+	} catch {
+		return false;
+	}
+}
+
+if (isMainModule()) {
+	process.exitCode = await main();
+}

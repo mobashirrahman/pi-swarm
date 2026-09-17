@@ -18,6 +18,8 @@ import { ToolExecutor, registerBuiltinTools, registerWorkspaceTools } from "./to
 import { CancellationTree } from "./cancellation.ts";
 import { PersistentToolJournal } from "./tool-journal.ts";
 import { EventBus } from "./events.ts";
+import { TelemetryStore } from "./telemetry.ts";
+import { benchmarkTableSize, fetchOpenRouterScores } from "./benchmarks.ts";
 import type { LeaseStore } from "./leases.ts";
 import type { Workspace } from "./workspace.ts";
 import { AgentStore, type AgentRow } from "./store.ts";
@@ -68,6 +70,8 @@ export class SwarmService {
 	private readonly events = new EventBus();
 	/** Sandbox root for workspace tools (undefined = no workspace tools). */
 	readonly workspace: Workspace | undefined;
+	/** Persisted internal performance benchmark (TTFT, tokens/sec, latency). */
+	readonly telemetry: TelemetryStore | undefined;
 	private agentCounter = 0;
 
 	constructor(options: {
@@ -101,6 +105,9 @@ export class SwarmService {
 			}
 		}
 		this.store = options.store;
+		// Internal performance benchmark, persisted alongside agents so it is
+		// shared across worker processes and survives restarts.
+		this.telemetry = this.store ? new TelemetryStore(this.store.database) : undefined;
 		// Durable journal when a store exists — side-effect safety across
 		// restarts (the tool executor consults lookup before re-running).
 		this.toolExecutor = options.tools ?? new ToolExecutor({
@@ -112,7 +119,7 @@ export class SwarmService {
 			// Workspace tools are opt-in: they need a sandbox root.
 			if (this.workspace) registerWorkspaceTools(this.toolExecutor, this.workspace);
 		}
-		this.dispatcher = new Dispatcher({ accounts: this.accounts, leases: options.leases });
+		this.dispatcher = new Dispatcher({ accounts: this.accounts, leases: options.leases, telemetry: this.telemetry });
 		// Logged-out accounts stay out of the pool when their chat needs a
 		// key (pi-free #530): only keyless-usable providers stay enabled
 		// without a credential. Cline/FastRouter list keyless but 401 on chat.
@@ -139,6 +146,16 @@ export class SwarmService {
 		this.agentCounter += 1;
 		const agentId = request.spec.agentId ?? `agent-${now.toString(36)}-${this.agentCounter}`;
 		const spec: AgentSpec = { ...DEFAULT_SPEC, ...request.spec, agentId };
+
+		if (spec.parentAgentId) {
+			const parentLive = this.tree.live().includes(spec.parentAgentId);
+			const parentKnown = parentLive || this.store?.getAgent(spec.parentAgentId) !== undefined;
+			if (!parentKnown) {
+				// Dangling parent link: the child would be unreapable by
+				// parent-cancel. Allow (back-compat) but say so loudly.
+				_logger.warn("spawn_unknown_parent", { agentId, parent: spec.parentAgentId });
+			}
+		}
 
 		if (this.store) {
 			this.store.recordIdempotency(request.idempotencyKey ?? `auto:${agentId}`, agentId, now);
@@ -179,7 +196,13 @@ export class SwarmService {
 						});
 					}
 					if (!result.ok) {
-						this.events.emit(spec.agentId, "agent.failed", { turn: opts.turnIndex, reason: result.reason });
+						// Aborts are cancellation, not failure: the runtime
+						// reports its own cancelled transition. Emitting
+						// agent.failed here produced a spurious failure event
+						// on every cancelled agent (observed live).
+						if (result.reason !== "aborted") {
+							this.events.emit(spec.agentId, "agent.failed", { turn: opts.turnIndex, reason: result.reason });
+						}
 					}
 					return result;
 				},
@@ -261,6 +284,19 @@ export class SwarmService {
 		return cancelled.length > 0;
 	}
 
+	/**
+	 * Administrative capacity reset: close circuits and clear model bans for
+	 * one account (or all). Recovers the pool after a credential rotation or
+	 * a false-positive trip without restarting the process.
+	 */
+	resetCapacity(accountId?: string): { reset: string[]; clearedBans: number } {
+		const ids = accountId ? [accountId] : this.accounts.all().map((account) => account.accountId);
+		let clearedBans = 0;
+		for (const id of ids) clearedBans += this.dispatcher.resetAccount(id).clearedBans;
+		_logger.info("capacity_reset", { accounts: ids, clearedBans });
+		return { reset: ids, clearedBans };
+	}
+
 	// =========================================================================
 	// Capacity view
 	// =========================================================================
@@ -289,9 +325,53 @@ export class SwarmService {
 
 	/** Load candidate catalogs (call once at startup, refresh hourly). */
 	async refreshCatalogs(): Promise<number> {
+		// Intelligence scores first, so candidates are scored as they load.
+		const scores = await fetchOpenRouterScores();
+		if (scores.installed > 0) {
+			_logger.info("intelligence_scores_ready", { live: scores.installed, vendored: benchmarkTableSize() });
+		}
 		const candidates = await this.dispatcher.loadCandidates();
-		_logger.info("catalogs_loaded", { candidates: candidates.length });
+		const scored = candidates.filter((candidate) => candidate.ciScore !== null).length;
+		_logger.info("catalogs_loaded", { candidates: candidates.length, scored });
 		return candidates.length;
+	}
+
+	/**
+	 * The routing view: every candidate with the signals that decide its fate.
+	 * This is what "which provider gets invoked" actually depends on.
+	 */
+	routingView(options: { limit?: number } = {}): Array<{
+		accountId: string;
+		modelId: string;
+		quality: number | null;
+		latencyMs: number | null;
+		ttftMs: number | null;
+		tokensPerSecond: number | null;
+		successRate: number | null;
+		samples: number;
+		inFlight: number;
+		circuit: string;
+	}> {
+		const candidates = this.dispatcher.candidates();
+		const rows = candidates.map((candidate) => {
+			const telemetry = this.telemetry?.get(candidate.accountId, candidate.modelId);
+			const total = (telemetry?.samples ?? 0) + (telemetry?.failures ?? 0);
+			return {
+				accountId: candidate.accountId,
+				modelId: candidate.modelId,
+				quality: candidate.ciScore,
+				latencyMs: telemetry?.latencyMs ?? null,
+				ttftMs: telemetry?.ttftMs ?? null,
+				tokensPerSecond: telemetry?.tokensPerSecond ?? null,
+				successRate: total > 0 ? (telemetry?.samples ?? 0) / total : null,
+				samples: total,
+				inFlight: this.dispatcher.quota.inFlightCount(candidate.accountId),
+				circuit: this.dispatcher.circuit.get(candidate.accountId).state,
+			};
+		});
+		// Best first: scored models by quality, then measured speed.
+		rows.sort((a, b) => (b.quality ?? -1) - (a.quality ?? -1) || (b.tokensPerSecond ?? -1) - (a.tokensPerSecond ?? -1));
+		return options.limit !== undefined ? rows.slice(0, options.limit) : rows;
 	}
 }
 

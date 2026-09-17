@@ -35,6 +35,8 @@ export interface SelectorContext {
 	remainingRequests: ReadonlyMap<string, number | undefined>;
 	/** EWMA of successful turn latency per "accountId/modelId" (ms). */
 	ewmaLatencyMs: ReadonlyMap<string, number>;
+	/** EWMA of observed output tokens/sec per "accountId/modelId". */
+	tokensPerSecond?: ReadonlyMap<string, number> | undefined;
 	/** Recent success rate per "accountId/modelId" (0..1). */
 	successRate: ReadonlyMap<string, number>;
 	/** Blacklisted "accountId/modelId" keys. */
@@ -149,11 +151,23 @@ function stableHash(input: string): number {
 	return h >>> 0;
 }
 
-function latencyFor(candidate: Candidate, ctx: SelectorContext): number {
+function latencyFor(candidate: Candidate, ctx: SelectorContext, fallbackMs: number): number {
 	const known = ctx.ewmaLatencyMs.get(`${candidate.accountId}/${candidate.modelId}`);
 	if (known !== undefined) return known;
-	// Unproven candidate: pessimistic default so a known-good model wins ties.
-	return 30_000;
+	// Unproven candidate: use the fleet median when anything is measured, so
+	// a new model competes instead of eating a fixed 30s penalty that
+	// starves it forever behind one known-good model (herding load onto a
+	// single model). Falls back to the pessimistic default when nothing is
+	// measured yet.
+	return fallbackMs;
+}
+
+/** Median of measured latencies, or the pessimistic default when none exist. */
+function fallbackLatencyMs(ctx: SelectorContext): number {
+	const measured = [...ctx.ewmaLatencyMs.values()].filter((v) => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+	if (measured.length === 0) return 30_000;
+	const mid = Math.floor(measured.length / 2);
+	return measured.length % 2 === 1 ? (measured[mid] as number) : ((measured[mid - 1] as number) + (measured[mid] as number)) / 2;
 }
 
 // =============================================================================
@@ -186,7 +200,7 @@ export function selectTurnCandidate(
 	const ranked: RoutedCandidate[] = eligible.map((candidate) => {
 		const nextCapacity = ctx.nextCapacityAt.get(candidate.accountId) ?? 0;
 		const waitMs = Math.max(0, nextCapacity - ctx.now);
-		const latencyMs = latencyFor(candidate, ctx);
+		const latencyMs = latencyFor(candidate, ctx, fallbackLatencyMs(ctx));
 		const key = `${candidate.accountId}/${candidate.modelId}`;
 		const rate = ctx.successRate.get(key) ?? 0;
 		return {
@@ -206,15 +220,21 @@ export function selectTurnCandidate(
 		// Tie-break 1: success rate.
 		const rateDiff = b.diag.successRate - a.diag.successRate;
 		if (rateDiff !== 0) return rateDiff;
-		// Tie-break 2: quota headroom (unknown → -1, below any known value).
+		// Tie-break 2: observed generation speed. Same projected finish but one
+		// model streams 3× faster — that is the difference between a swarm
+		// finishing in seconds and in a minute. Unmeasured models rank last.
+		const tpsA = ctx.tokensPerSecond?.get(`${a.candidate.accountId}/${a.candidate.modelId}`) ?? -1;
+		const tpsB = ctx.tokensPerSecond?.get(`${b.candidate.accountId}/${b.candidate.modelId}`) ?? -1;
+		if (tpsA !== tpsB) return tpsB - tpsA;
+		// Tie-break 3: quota headroom (unknown → -1, below any known value).
 		const remA = a.diag.remaining ?? -1;
 		const remB = b.diag.remaining ?? -1;
 		if (remA !== remB) return remB - remA;
-		// Tie-break 3: lower in-flight.
+		// Tie-break 4: lower in-flight.
 		const infA = ctx.inFlight.get(a.candidate.accountId) ?? 0;
 		const infB = ctx.inFlight.get(b.candidate.accountId) ?? 0;
 		if (infA !== infB) return infA - infB;
-		// Tie-break 4: stable hash — deterministic spread. agentId is folded
+		// Tie-break 5: stable hash — deterministic spread. agentId is folded
 		// in so concurrent agents decorrelate instead of herding on one model.
 		const hashA = stableHash(`${req.agentId ?? ""}|${a.candidate.accountId}/${a.candidate.modelId}`);
 		const hashB = stableHash(`${req.agentId ?? ""}|${b.candidate.accountId}/${b.candidate.modelId}`);
