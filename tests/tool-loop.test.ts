@@ -22,7 +22,8 @@ interface CapturedRequest {
 type MockTurn =
 	| { kind: "tool_call"; name: string; args: string }
 	| { kind: "text"; content: string }
-	| { kind: "empty" };
+	| { kind: "empty" }
+	| { kind: "status"; status: number };
 
 function sseChunk(payload: unknown): string {
 	return `data: ${JSON.stringify(payload)}\n\n`;
@@ -44,6 +45,13 @@ function startMockProvider(
 			requests.push(body);
 			const turnIndex = requests.length - 1;
 			const reply = script(turnIndex, body);
+
+			if (reply.kind === "status") {
+				// Error response (e.g. 429) — no SSE body.
+				res.writeHead(reply.status, { "Content-Type": "application/json" });
+				res.end(JSON.stringify({ error: { message: `HTTP ${reply.status}` } }));
+				return;
+			}
 
 			res.writeHead(200, { "Content-Type": "text/event-stream" });
 			if (reply.kind === "tool_call") {
@@ -117,7 +125,13 @@ describe("tool loop end-to-end (fake provider, real HTTP)", () => {
 			maxConcurrency: 2,
 			baseUrl,
 		});
-		const dispatcher = new Dispatcher({ accounts, fetchModels: async () => models });
+		const dispatcher = new Dispatcher({
+			accounts,
+			fetchModels: async () => models,
+			// Fast quota knobs so the 429-storm test does not wait real windows.
+			quotaBackoffBaseMs: 5,
+			quotaBlacklistTtlMs: 50,
+		});
 		await dispatcher.loadCandidates();
 		const runtime = new AgentRuntime(
 			spec(),
@@ -221,6 +235,33 @@ describe("tool loop end-to-end (fake provider, real HTTP)", () => {
 		// Bounded: the guard fires well before maxTurns (4) of quota burn.
 		expect(requests.length).toBeLessThanOrEqual(4);
 	});
+
+	it("waits out a 429 storm instead of burning the attempt budget", async () => {
+		// Every request is rate-limited for the first 4 sends, then one
+		// succeeds. With maxAttempts = 1 a naive loop dies immediately; quota
+		// waits must extend the budget so the window can refill.
+		await start((turnIndex) =>
+			turnIndex < 4 ? { kind: "status", status: 429 } : { kind: "text", content: "Survived the storm." },
+		);
+		const toolExecutor = new ToolExecutor();
+		registerBuiltinTools(toolExecutor);
+		const { runtime, dispatcher } = await buildRuntime(toolExecutor, [
+			{ id: "throttled-model", context_length: 128_000 },
+		]);
+
+		// One provider attempt allowed; the 429s are waits, not attempts.
+		const specWithOneAttempt = { ...spec(), maxProviderAttemptsPerTurn: 1 };
+		const constrained = new AgentRuntime(
+			specWithOneAttempt,
+			{ executeTurn: (messages, opts) => dispatcher.executeTurn(messages, opts, toolExecutor.specs()) },
+			{ execute: (id, turn, call, tool, argsJson, signal) => toolExecutor.execute(id, turn, call, tool, argsJson, signal) },
+		);
+
+		const final = await constrained.run();
+		expect(final).toBe("Survived the storm.");
+		expect(requests.length).toBeGreaterThan(4); // it kept retrying past maxAttempts
+		void runtime;
+	}, 30_000);
 
 	it("cancelling mid-run aborts the agent without a provider failure", async () => {
 		await start();

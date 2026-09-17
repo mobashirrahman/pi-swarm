@@ -55,6 +55,17 @@ export interface DispatcherOptions {
 	leases?: LeaseStore | undefined;
 	/** Lease duration; must exceed a turn's wall time. */
 	leaseTtlMs?: number;
+	/**
+	 * Base backoff for quota (429) waits. Quota windows refill on
+	 * seconds-to-minutes scales, so this is deliberately larger than the
+	 * transient-error base. Configurable so tests need not wait it out.
+	 */
+	quotaBackoffBaseMs?: number;
+	/**
+	 * How long a quota (429) strike shadows a model. Quota windows refill, so
+	 * this is far shorter than the session TTL for other failures.
+	 */
+	quotaBlacklistTtlMs?: number;
 }
 
 interface ModelHealth {
@@ -77,6 +88,7 @@ export class Dispatcher {
 	private readonly defaultMaxOutputTokens: number;
 	private readonly leases: LeaseStore | undefined;
 	private readonly leaseTtlMs: number;
+	private readonly quotaBackoffBaseMs: number;
 	/** "accountId/modelId" → health. */
 	private readonly health = new Map<string, ModelHealth>();
 	/** providerId → accounts. */
@@ -88,7 +100,7 @@ export class Dispatcher {
 	constructor(options: DispatcherOptions) {
 		this.accounts = options.accounts;
 		this.quota = new QuotaRegistry();
-		this.blacklist = new Blacklist({ quotaTtlMs: 30_000 });
+		this.blacklist = new Blacklist({ quotaTtlMs: options.quotaBlacklistTtlMs ?? 30_000 });
 		this.circuit = new CircuitBreaker();
 		this.fetchModels = options.fetchModels ?? (async (account) => {
 			const result = await fetchCatalog(account);
@@ -98,6 +110,7 @@ export class Dispatcher {
 		this.defaultMaxOutputTokens = options.defaultMaxOutputTokens ?? 4096;
 		this.leases = options.leases;
 		this.leaseTtlMs = options.leaseTtlMs ?? 5 * 60 * 1000;
+		this.quotaBackoffBaseMs = options.quotaBackoffBaseMs ?? 5_000;
 		for (const account of this.accounts.all()) {
 			const list = this.accountsByProvider.get(account.providerId) ?? [];
 			list.push(account);
@@ -201,7 +214,13 @@ export class Dispatcher {
 			}
 		}
 
-		for (const key of this.blacklist.snapshot().keys()) blacklisted.add(key);
+		// Only entries still inside their (class-aware) TTL window block selection.
+		// Copying the raw snapshot made an EXPIRED quota strike permanent — the
+		// model could never be retried and the turn spun until its deadline
+		// (measured: a single 429 stalled a turn for 90s+).
+		for (const key of this.blacklist.snapshot().keys()) {
+			if (this.blacklist.isBlacklisted(key, now)) blacklisted.add(key);
+		}
 		if (excludeModels) for (const key of excludeModels) blacklisted.add(key);
 		for (const key of this.anonModelBans) blacklisted.add(key);
 
@@ -297,7 +316,16 @@ export class Dispatcher {
 		this.turnDeadline = Date.now() + 240_000; // transient-gap wait bound
 
 		let attempt = 1;
-		while (attempt <= opts.maxAttempts) {
+		/**
+		 * Quota (429) waits do NOT consume the provider-attempt budget: a rate
+		 * limit is a WAIT, not a failed attempt. Without this a 429 storm kills
+		 * the turn at `maxAttempts` sends (~60s measured) even though the
+		 * window would refill — the opposite of the product goal. Waits remain
+		 * bounded by the turn deadline and a hard cap.
+		 */
+		let quotaWaits = 0;
+		const MAX_QUOTA_WAITS = 20;
+		while (attempt <= opts.maxAttempts + quotaWaits && quotaWaits <= MAX_QUOTA_WAITS) {
 			if (opts.signal.aborted) return { ok: false, reason: "aborted" };
 			const now = Date.now();
 			const ctx = this.buildContext(now, estimatedTokens, excludeModels);
@@ -463,7 +491,12 @@ export class Dispatcher {
 				// (quota headers, Retry-After, or repeated failures across
 				// DIFFERENT models of the same account).
 				this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, cls, Date.now());
-				excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
+				// NOTE: deliberately NOT added to excludeModels. excludeModels is
+				// a permanent per-turn exclusion, which made a 429'd model
+				// unretryable for the whole turn even after its quota window
+				// refilled — the turn then spun on transient-gap waits until the
+				// deadline (measured: one 429 stalled a turn for 90s+). The
+				// blacklist's TTL is the correct gate: quota strikes expire.
 				const perModelStrikes = this.blacklist.snapshot().get(`${candidate.accountId}/${candidate.modelId}`)?.count ?? 0;
 				let accountDistinctFailures = 0;
 				for (const key of this.blacklist.snapshot().keys()) {
@@ -478,8 +511,9 @@ export class Dispatcher {
 				// llm7's anonymous window refills on ~15s scales (measured), so
 				// 1s-base jitter just burns attempts against a closed window.
 				const quotaClass = cls === "quota";
+				if (quotaClass) quotaWaits += 1; // a wait, not a failed attempt
 				const waitMs = outcome.quota.retryAfterMs
-					?? computeRetryBackoffMs(attempt - 1, quotaClass ? 5_000 : 1_000, { capMs: quotaClass ? 15_000 : 10_000 });
+					?? computeRetryBackoffMs(attempt - 1, quotaClass ? this.quotaBackoffBaseMs : 1_000, { capMs: quotaClass ? 15_000 : 10_000 });
 				if (opts.signal.aborted) return { ok: false, reason: "aborted" };
 				await sleep(Math.min(waitMs, quotaClass ? 15_000 : 10_000));
 				continue;
