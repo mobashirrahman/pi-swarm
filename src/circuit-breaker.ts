@@ -135,6 +135,16 @@ export class CircuitBreaker {
 		});
 	}
 
+	/**
+	 * Administrative reset: close the circuit immediately so the account is
+	 * routable again (operator recovery after a credential rotation or a
+	 * false-positive trip). Prefer this over waiting out a long cooldown.
+	 */
+	reset(accountId: string): void {
+		this.state.set(accountId, { accountId, state: "closed", cooldownUntil: 0, consecutiveFailures: 0 });
+		this.halfOpenProgress.delete(accountId);
+	}
+
 	private cooldownFor(consecutiveFailures: number, retryAfterMs?: number): number {
 		if (retryAfterMs !== undefined && retryAfterMs > 0) {
 			return Math.min(retryAfterMs, this.maxCooldownMs);
