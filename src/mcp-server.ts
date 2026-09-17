@@ -26,7 +26,15 @@ import type { AgentSpec } from "./agent.ts";
 const SERVER_NAME = "pi-swarm";
 const SERVER_VERSION = "0.1.0";
 const PROTOCOL_VERSION = "2024-11-05";
-const DEFAULT_WAIT_TIMEOUT_MS = 120_000;
+/**
+ * Default `swarm_wait` budget. MUST stay under the MCP client's request
+ * timeout, which is 30s by default in OMP (and similar elsewhere): a longer
+ * block gets cut off client-side with an opaque "Request timeout" and the
+ * outcome unknown (observed live). When the agent is still running we return
+ * `timedOut: true` so the caller simply waits again — no config required.
+ * Harnesses configured with a longer `timeout` can pass a larger `timeoutMs`.
+ */
+const DEFAULT_WAIT_TIMEOUT_MS = 20_000;
 const WAIT_POLL_MS = 500;
 
 interface JsonRpcRequest {
@@ -72,12 +80,15 @@ const TOOLS: ToolDefinition[] = [
 	{
 		name: "swarm_wait",
 		description:
-			"Wait for an agent to reach a terminal state and return its final answer. Prefer this over polling swarm_status.",
+			"Wait for an agent to reach a terminal state and return its final answer. Returns {state, finalContent} on completion, or {state: \"running\", timedOut: true} if the wait window elapsed — in that case simply call swarm_wait again (free providers can take minutes).",
 		inputSchema: {
 			type: "object",
 			properties: {
 				agentId: { type: "string", description: "Agent id returned by swarm_spawn." },
-				timeoutMs: { type: "number", description: `How long to wait (default ${DEFAULT_WAIT_TIMEOUT_MS}).` },
+				timeoutMs: {
+					type: "number",
+					description: `How long to wait before returning timedOut (default ${DEFAULT_WAIT_TIMEOUT_MS}; keep under your MCP client's request timeout).`,
+				},
 			},
 			required: ["agentId"],
 		},
@@ -334,12 +345,19 @@ export async function runServer(): Promise<void> {
 				continue;
 			}
 
-			try {
-				const result = await handleMessage(backend, request);
-				if (result !== undefined) writeResult(request.id, result);
-			} catch (error) {
-				writeError(request.id, -32601, error instanceof Error ? error.message : String(error));
-			}
+			// Dispatch WITHOUT awaiting. A long-running call (swarm_wait can
+			// block for its whole window) must not block the server: awaiting
+			// here meant every later request sat unprocessed until the slow one
+			// finished, so even an instant swarm_spawn hit the client's 30s
+			// timeout (observed live). MCP clients pipeline requests.
+			void (async () => {
+				try {
+					const result = await handleMessage(backend, request);
+					if (result !== undefined) writeResult(request.id, result);
+				} catch (error) {
+					writeError(request.id, -32601, error instanceof Error ? error.message : String(error));
+				}
+			})();
 		}
 	}
 
