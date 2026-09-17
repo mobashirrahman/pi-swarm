@@ -69,6 +69,24 @@ export class AgentStore {
 				agent_id TEXT NOT NULL,
 				created_at INTEGER NOT NULL
 			);
+			CREATE TABLE IF NOT EXISTS transcript (
+				agent_id TEXT NOT NULL,
+				seq INTEGER NOT NULL,
+				role TEXT NOT NULL,
+				content TEXT,
+				tool_call_id TEXT,
+				tool_calls_json TEXT,
+				PRIMARY KEY (agent_id, seq)
+			);
+			CREATE TABLE IF NOT EXISTS tool_journal (
+				id TEXT PRIMARY KEY,
+				tool TEXT NOT NULL,
+				args_json TEXT NOT NULL,
+				status TEXT NOT NULL,
+				result_json TEXT,
+				started_at INTEGER NOT NULL,
+				finished_at INTEGER
+			);
 		`);
 	}
 
@@ -164,6 +182,75 @@ export class AgentStore {
 
 	recordIdempotency(key: string, agentId: string, now: number): void {
 		this.db.prepare("INSERT OR IGNORE INTO idempotency (key, agent_id, created_at) VALUES (?, ?, ?)").run(key, agentId, now);
+	}
+
+	// =========================================================================
+	// Transcript durability (crash recovery)
+	// =========================================================================
+
+	/** Append one committed message to the durable transcript. */
+	appendTranscriptMessage(agentId: string, seq: number, message: { role: string; content: string | null; tool_call_id?: string | undefined; tool_calls?: unknown }): void {
+		this.db
+			.prepare("INSERT OR REPLACE INTO transcript (agent_id, seq, role, content, tool_call_id, tool_calls_json) VALUES (?, ?, ?, ?, ?, ?)")
+			.run(agentId, seq, message.role, message.content, message.tool_call_id ?? null, message.tool_calls ? JSON.stringify(message.tool_calls) : null);
+	}
+
+	/** Load the durable transcript in order. */
+	loadTranscript(agentId: string): Array<{ role: string; content: string | null; tool_call_id?: string | undefined; tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }> | undefined }> {
+		const rows = this.db.prepare("SELECT seq, role, content, tool_call_id, tool_calls_json FROM transcript WHERE agent_id = ? ORDER BY seq").all(agentId) as Array<{
+			seq: number; role: string; content: string | null; tool_call_id: string | null; tool_calls_json: string | null;
+		}>;
+		return rows.map((row) => ({
+			role: row.role,
+			content: row.content,
+			tool_call_id: row.tool_call_id ?? undefined,
+			tool_calls: row.tool_calls_json ? (JSON.parse(row.tool_calls_json) as Array<{ id: string; type: string; function: { name: string; arguments: string } }>) : undefined,
+		}));
+	}
+
+	// =========================================================================
+	// Tool journal persistence (side-effect safety across restarts)
+	// =========================================================================
+
+	/** Record a tool execution's begin event. */
+	toolBegin(id: string, tool: string, argsJson: string, now: number): void {
+		this.db
+			.prepare("INSERT OR REPLACE INTO tool_journal (id, tool, args_json, status, started_at) VALUES (?, ?, ?, 'running', ?)")
+			.run(id, tool, argsJson, now);
+	}
+
+	toolComplete(id: string, resultJson: string, now: number): void {
+		this.db
+			.prepare("UPDATE tool_journal SET status = 'completed', result_json = ?, finished_at = ? WHERE id = ?")
+			.run(resultJson, now, id);
+	}
+
+	toolFail(id: string, errorClass: string, now: number): void {
+		this.db
+			.prepare("UPDATE tool_journal SET status = 'failed', error_class = ?, finished_at = ? WHERE id = ?")
+			.run(errorClass, now, id);
+	}
+
+	toolLookup(id: string): { status: "running" | "completed" | "failed"; resultJson?: string | undefined } | undefined {
+		const row = this.db.prepare("SELECT status, result_json FROM tool_journal WHERE id = ?").get(id) as
+			| { status: "running" | "completed" | "failed"; result_json: string | null }
+			| undefined;
+		if (!row) return undefined;
+		return { status: row.status, resultJson: row.result_json ?? undefined };
+	}
+
+	/**
+	 * Tool calls left in "running" — the process died between the side-effect
+	 * attempt and its outcome. Never auto-re-run (side effect may have fired).
+	 * The execution id is `${agentId}:${turnIndex}:${callId}`.
+	 */
+	uncertainToolCalls(): Array<{ agentId: string; executionId: string; tool: string }> {
+		const rows = this.db.prepare("SELECT id, tool FROM tool_journal WHERE status = 'running'").all() as Array<{ id: string; tool: string }>;
+		return rows.map((row) => ({
+			agentId: row.id.split(":")[0] ?? "unknown",
+			executionId: row.id,
+			tool: row.tool,
+		}));
 	}
 
 	close(): void {

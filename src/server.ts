@@ -10,6 +10,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { AgentStore } from "./store.ts";
 import { SwarmService } from "./swarm.ts";
+import { recoverInterrupted } from "./recovery.ts";
 import { createLogger } from "./logger.ts";
 
 const _logger = createLogger("server");
@@ -33,9 +34,16 @@ async function main(): Promise<number> {
 	const store = new AgentStore(DB_PATH);
 	const service = new SwarmService({ store });
 
-	// Recover agents from a previous run as failed (interrupted).
-	for (const agent of store.recoverableAgents()) {
-		store.upsertAgent({ ...agent, state: "failed", updatedAt: Date.now(), failReason: "interrupted_by_restart" });
+	// Recover agents from a previous run: interrupted agents are failed with
+	// their durable transcript preserved; uncertain tool calls are reported
+	// and never auto-re-run.
+	const report = recoverInterrupted(store);
+	_logger.info("recovery_complete", {
+		interrupted: report.interruptedAgents.length,
+		uncertainToolCalls: report.uncertainToolCalls.length,
+	});
+	for (const uncertain of report.uncertainToolCalls) {
+		_logger.warn("uncertain_tool_call", { agent: uncertain.agentId, tool: uncertain.tool });
 	}
 
 	const candidates = await service.refreshCatalogs();

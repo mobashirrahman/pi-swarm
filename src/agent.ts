@@ -20,8 +20,16 @@ const _logger = createLogger("agent");
 
 export type AgentState = "queued" | "running" | "waiting_capacity" | "completed" | "failed" | "cancelled";
 
+/**
+ * Consecutive turns that may repeat the SAME tool call before the run is
+ * declared stuck. 3 allows one legitimate retry after a tool error.
+ */
+const MAX_REPEATED_TOOL_TURNS = 3;
+
 export interface AgentSpec {
 	agentId: string;
+	/** Parent agent in a swarm tree — cancelling the parent cancels this one. */
+	parentAgentId?: string | undefined;
 	/** Task prompt (first user message). */
 	task: string;
 	system?: string | undefined;
@@ -37,6 +45,7 @@ export interface AgentSpec {
 export interface AgentEvents {
 	onStateChange?: ((state: AgentState, agentId: string) => void) | undefined;
 	onTurnCommitted?: ((turnIndex: number, content: string) => void) | undefined;
+	onToolResults?: ((turnIndex: number, count: number) => void) | undefined;
 	onReroute?: ((turnIndex: number, from: string, to: string, reason: string) => void) | undefined;
 	onComplete?: ((finalContent: string) => void) | undefined;
 	onFail?: ((reason: string) => void) | undefined;
@@ -62,6 +71,9 @@ export class AgentRuntime {
 	private readonly transcript: ChatMessage[] = [];
 	private readonly abortController = new AbortController();
 	private readonly deadline: number;
+	/** Loop guard: signature + count of consecutive identical tool turns. */
+	private lastToolSignature = "";
+	private repeatedToolTurns = 0;
 
 	constructor(
 		private readonly spec: AgentSpec,
@@ -78,6 +90,9 @@ export class AgentRuntime {
 					signal: AbortSignal;
 				},
 			) => Promise<{ ok: true; outcome: Extract<TurnOutcome, { ok: true }>; accountId: string; modelId: string } | { ok: false; reason: string }>;
+		},
+		private readonly toolExecutor: {
+			execute: (agentId: string, turnIndex: number, callId: string, tool: string, argsJson: string, signal: AbortSignal) => Promise<string>;
 		},
 		private readonly events: AgentEvents = {},
 	) {
@@ -151,20 +166,48 @@ export class AgentRuntime {
 			this.transcript.push(result.outcome.message);
 			this.events.onTurnCommitted?.(turn, result.outcome.content);
 
-			// v1: no tool execution — a tool-call response ends the run with
-			// the content so far (real tool runtime lands in Phase 3).
+			// No tool calls → final answer.
 			if (result.outcome.toolCalls.length === 0) {
 				this.transition("completed");
 				this.events.onComplete?.(result.outcome.content);
 				return result.outcome.content;
 			}
-			_logger.info("tool_calls_received_tool_runtime_pending", {
-				agentId: this.spec.agentId,
-				count: result.outcome.toolCalls.length,
-			});
-			this.transition("completed");
-			this.events.onComplete?.(result.outcome.content);
-			return result.outcome.content;
+
+			// Execute each tool call through the journaled executor, append
+			// results as tool messages, then continue to the next turn — the
+			// model sees its own tool results in the transcript.
+			const callSignature = result.outcome.toolCalls
+				.map((call) => `${call.name}:${call.arguments}`)
+				.sort()
+				.join("|");
+			if (callSignature === this.lastToolSignature) {
+				this.repeatedToolTurns += 1;
+			} else {
+				this.repeatedToolTurns = 1;
+				this.lastToolSignature = callSignature;
+			}
+			// Loop guard: a model that keeps issuing the SAME call is stuck
+			// (observed live: a reasoning-only model re-calling calculator
+			// until maxTurns, burning quota each turn). Stop early and say so.
+			if (this.repeatedToolTurns > MAX_REPEATED_TOOL_TURNS) {
+				this.transition("failed");
+				this.events.onFail?.("tool_loop_detected");
+				throw new Error("tool loop detected: repeated identical tool call");
+			}
+
+			for (const call of result.outcome.toolCalls) {
+				if (this.abortController.signal.aborted) return this.abortFinal();
+				const toolResult = await this.toolExecutor.execute(
+					this.spec.agentId,
+					turn,
+					call.id,
+					call.name,
+					call.arguments,
+					this.abortController.signal,
+				);
+				this.transcript.push({ role: "tool", content: toolResult, tool_call_id: call.id });
+			}
+			this.events.onToolResults?.(turn, result.outcome.toolCalls.length);
 		}
 
 		this.transition("failed");

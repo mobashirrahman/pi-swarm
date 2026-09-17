@@ -349,6 +349,27 @@ export class Dispatcher {
 			this.applyQuotaObservation(candidate.accountId, outcome.quota, outcome.ok ? outcome.usage?.totalTokens : undefined);
 
 			if (outcome.ok) {
+				// Model-defect guard: a 200 with neither content nor tool calls
+				// is not an answer. Reasoning-only models (llm7's GLM returns
+				// empty `content` with the text in `reasoning`) land here, and
+				// committing "" would silently end the agent with nothing.
+				// Treat it as a retryable model defect: strike THIS model and
+				// reroute — a different model may answer properly.
+				if (outcome.content.trim().length === 0 && outcome.toolCalls.length === 0) {
+					this.quota.commit(reservationId, outcome.usage?.totalTokens ?? 0);
+					this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, "empty_response", Date.now());
+					excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
+					this.recordHealth(candidate, outcome.latencyMs, false);
+					_logger.info("empty_response_reroute", {
+						agentId: opts.agentId,
+						turn: opts.turnIndex,
+						account: candidate.accountId,
+						model: candidate.modelId,
+						attempt,
+					});
+					await sleep(computeRetryBackoffMs(attempt - 1, 1_000));
+					continue;
+				}
 				this.quota.commit(reservationId, outcome.usage?.totalTokens ?? 0);
 				this.circuit.recordSuccess(candidate.accountId);
 				this.blacklist.clear(`${candidate.accountId}/${candidate.modelId}`);
@@ -427,6 +448,25 @@ export class Dispatcher {
 				this.anonModelBans.add(`${candidate.accountId}/${candidate.modelId}`);
 				excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
 				continue; // try another model on the same account
+			}
+			if (cls === "bad_request" && tools && tools.length > 0) {
+				// A 400 on a TOOL-BEARING request usually means this model does
+				// not accept the tool payload (observed live: mistral-Nemo via
+				// llm7 400s where GLM executes tools fine). That is a model
+				// capability limit, not a malformed request — reroute instead of
+				// failing the turn. If every candidate 400s, the attempts
+				// exhaust and the turn still fails, so a genuinely broken
+				// request is not masked.
+				this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, "no_tool_support", Date.now());
+				excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
+				_logger.info("tool_unsupported_reroute", {
+					agentId: opts.agentId,
+					account: candidate.accountId,
+					model: candidate.modelId,
+					attempt,
+				});
+				await sleep(computeRetryBackoffMs(attempt - 1, 500));
+				continue;
 			}
 			if (cls === "model_gone") {
 				this.blacklist.recordFailure(`${candidate.accountId}/${candidate.modelId}`, cls, Date.now());

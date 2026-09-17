@@ -15,3 +15,7 @@ export * from "./agent.ts";
 export * from "./dispatcher.ts";
 export * from "./store.ts";
 export * from "./swarm.ts";
+export * from "./tool-journal.ts";
+export * from "./tools.ts";
+export * from "./cancellation.ts";
+export * from "./recovery.ts";

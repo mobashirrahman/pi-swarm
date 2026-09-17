@@ -13,6 +13,9 @@ import { AgentRuntime, type AgentSpec, type AgentState } from "./agent.ts";
 import { AccountRegistry, SEED_PROVIDERS, resolveKey, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
 import { createLogger } from "./logger.ts";
 import { Dispatcher } from "./dispatcher.ts";
+import { ToolExecutor, registerBuiltinTools } from "./tools.ts";
+import { CancellationTree } from "./cancellation.ts";
+import { PersistentToolJournal } from "./tool-journal.ts";
 import { AgentStore, type AgentRow } from "./store.ts";
 import type { ChatMessage } from "./stream.ts";
 
@@ -54,11 +57,12 @@ export class SwarmService {
 	readonly accounts: AccountRegistry;
 	readonly dispatcher: Dispatcher;
 	private readonly store: AgentStore | undefined;
-	/** Live runtimes keyed by agentId (in-flight work). */
-	private readonly runtimes = new Map<string, AgentRuntime>();
+	private readonly toolExecutor: ToolExecutor;
+	/** Live runtimes + parent links for tree cancellation. */
+	private readonly tree = new CancellationTree();
 	private agentCounter = 0;
 
-	constructor(options: { store?: AgentStore | undefined; accounts?: AccountRegistryEntry[] } = {}) {
+	constructor(options: { store?: AgentStore | undefined; accounts?: AccountRegistryEntry[]; tools?: ToolExecutor | undefined } = {}) {
 		this.accounts = new AccountRegistry();
 		if (options.accounts) {
 			for (const account of options.accounts) this.accounts.register(account);
@@ -76,6 +80,12 @@ export class SwarmService {
 			}
 		}
 		this.store = options.store;
+		// Durable journal when a store exists — side-effect safety across
+		// restarts (the tool executor consults lookup before re-running).
+		this.toolExecutor = options.tools ?? new ToolExecutor({
+			journal: this.store ? new PersistentToolJournal(this.store) : undefined,
+		});
+		if (!options.tools) registerBuiltinTools(this.toolExecutor);
 		this.dispatcher = new Dispatcher({ accounts: this.accounts });
 		// Logged-out accounts stay out of the pool when their chat needs a
 		// key (pi-free #530): only keyless-usable providers stay enabled
@@ -110,7 +120,7 @@ export class SwarmService {
 		}
 
 		const runtime = this.createRuntime(spec, now);
-		this.runtimes.set(agentId, runtime);
+		this.tree.register(spec.agentId, spec.parentAgentId, runtime);
 		// Fire-and-forget with contained rejection (async job contract).
 		void runtime.run().catch(() => undefined);
 		return { agentId, duplicate: false };
@@ -121,7 +131,7 @@ export class SwarmService {
 			spec,
 			{
 				executeTurn: async (messages, opts) => {
-					const result = await this.dispatcher.executeTurn(messages, opts);
+					const result = await this.dispatcher.executeTurn(messages, opts, this.toolExecutor?.specs());
 					if (this.store && result.ok) {
 						this.store.recordAttempt({
 							attemptId: `${opts.agentId}:${opts.turnIndex}:${result.accountId}`,
@@ -138,10 +148,24 @@ export class SwarmService {
 				},
 			},
 			{
+				execute: (agentId, turnIndex, callId, tool, argsJson, signal) =>
+					this.toolExecutor.execute(agentId, turnIndex, callId, tool, argsJson, signal),
+			},
+			{
 				onStateChange: (state) => {
 					if (this.store) {
 						const row = this.store.getAgent(spec.agentId);
 						if (row) this.store.upsertAgent({ ...row, state, updatedAt: Date.now() });
+					}
+				},
+				onTurnCommitted: (turnIndex, content) => {
+					// Durable transcript: the committed assistant message survives
+					// restarts so recovery can distinguish committed from lost.
+					if (this.store) {
+						this.store.appendTranscriptMessage(spec.agentId, turnIndex * 10, {
+							role: "assistant",
+							content,
+						});
 					}
 				},
 				onComplete: (content) => {
@@ -149,12 +173,14 @@ export class SwarmService {
 						const row = this.store.getAgent(spec.agentId);
 						if (row) this.store.upsertAgent({ ...row, state: "completed", updatedAt: Date.now(), finalContent: content });
 					}
+					this.tree.unregister(spec.agentId);
 				},
 				onFail: (reason) => {
 					if (this.store) {
 						const row = this.store.getAgent(spec.agentId);
 						if (row) this.store.upsertAgent({ ...row, state: "failed", updatedAt: Date.now(), failReason: reason });
 					}
+					this.tree.unregister(spec.agentId);
 				},
 			},
 		);
@@ -163,23 +189,25 @@ export class SwarmService {
 
 	getAgent(agentId: string): (AgentRow & { transcript?: ReadonlyArray<ChatMessage> }) | undefined {
 		const row = this.store?.getAgent(agentId);
-		const runtime = this.runtimes.get(agentId);
+		const runtime = this.tree.live().includes(agentId) ? this.runtimeFor(agentId) : undefined;
 		if (row) {
 			return { ...row, transcript: runtime?.getTranscript() };
 		}
-		const liveRuntime = this.runtimes.get(agentId);
-		if (liveRuntime) {
-			const state = liveRuntime.getState();
-			return { agentId, spec: liveRuntime["spec"], state, createdAt: 0, updatedAt: Date.now(), transcript: liveRuntime.getTranscript() };
+		if (runtime) {
+			const state = runtime.getState();
+			return { agentId, spec: runtime["spec"], state, createdAt: 0, updatedAt: Date.now(), transcript: runtime.getTranscript() };
 		}
 		return undefined;
 	}
 
+	private runtimeFor(agentId: string): AgentRuntime | undefined {
+		// The tree holds live runtimes; expose via a lookup hook.
+		return this.tree.lookup(agentId);
+	}
+
 	cancelAgent(agentId: string): boolean {
-		const runtime = this.runtimes.get(agentId);
-		if (!runtime) return false;
-		runtime.cancel();
-		return true;
+		const cancelled = this.tree.cancelTree(agentId);
+		return cancelled.length > 0;
 	}
 
 	// =========================================================================
