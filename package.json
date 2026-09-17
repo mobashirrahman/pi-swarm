@@ -82,7 +82,6 @@
 		"estree-walker": "^3.0.3",
 		"expect-type": "^1.4.0",
 		"fdir": "^6.5.0",
-		"fsevents": "^2.3.3",
 		"js-tokens": "^9.0.1",
 		"loupe": "^3.2.1",
 		"magic-string": "^0.30.21",
