@@ -75,7 +75,7 @@ check and tagged workflow described in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Status
 
-**All phases of the plan are implemented and verified.** 162 tests green.
+**All phases of the plan are implemented and verified.** 201 tests green.
 
 | Phase | Scope | State |
 | --- | --- | --- |
@@ -103,6 +103,43 @@ check and tagged workflow described in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 | Restart with a live agent | marked interrupted, transcript preserved |
 | 40 concurrent agents with leases | **40/40 completed** (bench harness) |
 | Two OS processes, cap = 1 account | mutual exclusion held, no starvation (test) |
+
+## Features
+
+### Quality-first routing tiers
+
+Every spawn accepts a `tierHint` — `frontier` (default: best available
+quality first), `balanced` (within 5 points of the best, then fastest), or
+`fast` (quickest model above the floor) — plus `qualityMetric`
+(`codingIndex` / `intelligenceIndex` / `agenticIndex`), `qualityFloor`, and
+`allowUnknownQuality`. Candidate filtering is fail-closed: a model routes
+only with zero pricing, a free provider category, or an explicit free
+entitlement, so unpriced catalogs can never leak paid spend.
+
+### Fan-out plans
+
+One goal, many subagents, one collect call. `swarm_plan` takes a `goal`,
+1–10 `subtasks`, and shared `defaults`, and returns a plan id plus child
+agent ids running concurrently across the best free backends.
+`swarm_gather` polls until every child settles and returns each answer;
+like `swarm_wait` it returns `timedOut: true` instead of outliving the
+client timeout. Cancelling the plan (or any child) reaps the whole tree,
+and siblings queue rather than die when they share one unknown-quota
+account.
+
+### Background refresh
+
+Intelligence scores and provider catalogs re-fetch on an hourly loop
+(`PI_SWARM_REFRESH_MS` overrides), in both the HTTP server and the embedded
+MCP backend — long-lived swarms track new free models without restarts.
+
+### Capability discovery
+
+Models prove `tools` / `vision` support with one tiny probed request before
+a turn is spent on them; verdicts cache for 24h in SQLite. Unprobed models
+get the benefit of the doubt at selection, probed denials reroute without
+burning an attempt — so vision turns reach models that actually see, and
+tool turns skip models that provably reject tools.
 
 ## Workspaces (sandbox boundary)
 
