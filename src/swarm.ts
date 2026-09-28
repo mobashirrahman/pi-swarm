@@ -11,6 +11,7 @@
 
 import { AgentRuntime, type AgentSpec, type AgentState } from "./agent.ts";
 import { AccountRegistry, resolveKey, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
+import { CapabilityCache } from "./capabilities.ts";
 import { availableSeeds } from "./providers.ts";
 import { candidateQuality } from "./selector.ts";
 import { createLogger } from "./logger.ts";
@@ -170,7 +171,7 @@ export class SwarmService {
 			// Workspace tools are opt-in: they need a sandbox root.
 			if (this.workspace) registerWorkspaceTools(this.toolExecutor, this.workspace);
 		}
-		this.dispatcher = new Dispatcher({ accounts: this.accounts, leases: options.leases, telemetry: this.telemetry });
+		this.dispatcher = new Dispatcher({ accounts: this.accounts, leases: options.leases, telemetry: this.telemetry, capabilities: new CapabilityCache(this.store) });
 		// Logged-out accounts stay out of the pool when their chat needs a
 		// key (pi-free #530): only keyless-usable providers stay enabled
 		// without a credential. Cline/FastRouter list keyless but 401 on chat.

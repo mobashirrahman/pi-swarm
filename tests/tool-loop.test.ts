@@ -133,6 +133,7 @@ describe("tool loop end-to-end (fake provider, real HTTP)", () => {
 			quotaBackoffBaseMs: 5,
 			quotaBlacklistTtlMs: 50,
 		});
+		for (const model of models) dispatcher["capabilities"].set("mock:primary", model.id, { tools: true });
 		await dispatcher.loadCandidates();
 		const runtime = new AgentRuntime(
 			spec(),

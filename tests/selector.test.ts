@@ -56,9 +56,17 @@ describe("selector: stage A eligibility", () => {
 	});
 
 	it("rejects candidates missing required capabilities", () => {
-		const candidates = [candidate({ accountId: "a:1", modelId: "m", capabilities: { text: true, vision: false, tools: false } })];
+		const candidates = [
+			candidate({ accountId: "a:1", modelId: "m", capabilities: { text: true, vision: false, tools: false }, capsProbed: { tools: true, vision: false } }),
+		];
 		const result = selectTurnCandidate(candidates, context(), { ...REQ, capabilities: ["text", "tools"] });
 		expect(result.rejected[0]?.reason).toBe("missing_capability_tools");
+	});
+
+	it("gives unprobed capabilities the benefit of the doubt", () => {
+		const candidates = [candidate({ accountId: "a:1", modelId: "m", capabilities: { text: true, vision: false, tools: false } })];
+		const result = selectTurnCandidate(candidates, context(), { ...REQ, capabilities: ["text", "tools"] });
+		expect(result.best?.candidate.modelId).toBe("m");
 	});
 
 	it("rejects context windows smaller than the transcript estimate", () => {

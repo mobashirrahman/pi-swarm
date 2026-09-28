@@ -159,6 +159,11 @@ arguments, or response bodies.
   "this model doesn't accept tools": the model is excluded and the turn
   reroutes. If every candidate 400s, the turn still fails, so a genuinely
   malformed request is not masked.
+- **Capability probing** — unprobed models get the benefit of the doubt at
+  selection, then prove tools/vision support with one tiny probed request
+  before the turn is spent. Verdicts cache for 24h in SQLite, so vision
+  routes to models that actually see, and tool turns skip models that
+  provably reject tools.
 - **Empty-response reroute** — a 200 with neither content nor tool calls
   (reasoning-only models) is a model defect: strike that model, reroute.
 

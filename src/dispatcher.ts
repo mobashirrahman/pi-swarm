@@ -25,6 +25,7 @@ import type { TelemetryStore } from "./telemetry.ts";
 import type { LeaseStore, TurnLease } from "./leases.ts";
 import type { HeaderQuota } from "./quota-headers.ts";
 import { bucketKey, type Candidate, type QualityMetric, type TierHint } from "./types.ts";
+import { CapabilityCache, probeToolsSupport, probeVisionSupport, type VerifiedCapabilities } from "./capabilities.ts";
 
 const _logger = createLogger("dispatcher");
 
@@ -74,6 +75,8 @@ export interface DispatcherOptions {
 	 * restarts and is shared across worker processes.
 	 */
 	telemetry?: TelemetryStore | undefined;
+	/** Probed model capabilities (vision/tools); memory-only without a store. */
+	capabilities?: CapabilityCache | undefined;
 }
 
 interface ModelHealth {
@@ -113,6 +116,7 @@ export class Dispatcher {
 	private readonly leaseTtlMs: number;
 	private readonly quotaBackoffBaseMs: number;
 	private readonly telemetry: TelemetryStore | undefined;
+	private readonly capabilities: CapabilityCache;
 	/** "accountId/modelId" → health. */
 	private readonly health = new Map<string, ModelHealth>();
 	/** providerId → accounts. */
@@ -136,6 +140,7 @@ export class Dispatcher {
 		this.leaseTtlMs = options.leaseTtlMs ?? 5 * 60 * 1000;
 		this.quotaBackoffBaseMs = options.quotaBackoffBaseMs ?? 5_000;
 		this.telemetry = options.telemetry;
+		this.capabilities = options.capabilities ?? new CapabilityCache();
 		for (const account of this.accounts.all()) {
 			const list = this.accountsByProvider.get(account.providerId) ?? [];
 			list.push(account);
@@ -181,6 +186,7 @@ export class Dispatcher {
 			for (const model of visible) {
 				const score = lookupModelScore(model.id, model.name);
 				const quality = score?.codingIndex ?? score?.intelligenceIndex;
+				const verified = this.capabilities.get(account.accountId, model.id);
 				candidates.push({
 					accountId: account.accountId,
 					providerId: account.providerId,
@@ -189,10 +195,15 @@ export class Dispatcher {
 					ciScore: quality ?? null,
 					qualityScores: score ? { ...score } : undefined,
 					freeBasis: model.pricing !== undefined ? "catalog" : account.category === "free" ? "provider_category" : "entitlement",
+					capabilities: {
+						text: true,
+						vision: verified?.vision ?? false,
+						tools: verified?.tools ?? true,
+					},
+					capsProbed: verified ? { tools: verified.tools !== undefined, vision: verified.vision !== undefined } : undefined,
 					// Prefer the measured/benchmarked window when the provider
 					// catalog does not publish one.
 					contextWindow: model.context_length ?? score?.contextWindow ?? 0,
-					capabilities: { text: true, vision: false, tools: true },
 				});
 			}
 		}
@@ -288,6 +299,57 @@ export class Dispatcher {
 			circuitOpen,
 			estimatedTokens,
 		};
+	}
+
+	/**
+	 * Verify a selected model's unverified vision/tools support before
+	 * spending the turn on it. Returns true when the model proved
+	 * UNSUPPORTED (caller excludes it and reselects without consuming an
+	 * attempt). Inconclusive probes keep the assumed capabilities and send.
+	 */
+	private async verifyCapabilities(
+		account: AccountRegistryEntry,
+		candidate: Candidate,
+		requirements: TurnRequirements,
+		signal: AbortSignal,
+	): Promise<boolean> {
+		const needTools = requirements.capabilities.includes("tools") && candidate.capsProbed?.tools !== true;
+		const needVision = requirements.capabilities.includes("vision") && candidate.capsProbed?.vision !== true;
+		if (!needTools && !needVision) return false;
+		const endpoint = { baseUrl: account.baseUrl, modelId: candidate.modelId, apiKey: resolveKey(account), signal };
+		const verified: VerifiedCapabilities = {};
+		if (needTools) {
+			const tools = await probeToolsSupport(endpoint);
+			if (tools === false) {
+				this.capabilities.set(account.accountId, candidate.modelId, { tools: false });
+				candidate.capsProbed = { tools: true, vision: candidate.capsProbed?.vision ?? false };
+				candidate.capabilities.tools = false;
+				_logger.info("tool_probe_unsupported", { account: account.accountId, model: candidate.modelId });
+				return true;
+			}
+			if (tools === true) verified.tools = true;
+		}
+		if (needVision) {
+			const vision = await probeVisionSupport(endpoint);
+			if (vision === false) {
+				this.capabilities.set(account.accountId, candidate.modelId, { vision: false });
+				candidate.capsProbed = { tools: candidate.capsProbed?.tools ?? false, vision: true };
+				candidate.capabilities.vision = false;
+				_logger.info("vision_probe_unsupported", { account: account.accountId, model: candidate.modelId });
+				return true;
+			}
+			if (vision === true) verified.vision = true;
+		}
+		if (verified.tools !== undefined || verified.vision !== undefined) {
+			this.capabilities.set(account.accountId, candidate.modelId, verified);
+			candidate.capsProbed = {
+				tools: candidate.capsProbed?.tools ?? verified.tools !== undefined,
+				vision: candidate.capsProbed?.vision ?? verified.vision !== undefined,
+			};
+			if (verified.tools !== undefined) candidate.capabilities.tools = true;
+			if (verified.vision !== undefined) candidate.capabilities.vision = true;
+		}
+		return false;
 	}
 
 	private isProbationBlock(accountId: string, blockKey: string): boolean {
@@ -445,6 +507,11 @@ export class Dispatcher {
 			const { candidate } = selection.best;
 			const account = this.accounts.get(candidate.accountId);
 			if (!account) return { ok: false, reason: "account_missing" };
+
+			if (await this.verifyCapabilities(account, candidate, requirements, opts.signal)) {
+				excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
+				continue;
+			}
 
 			const reservation = this.quota.tryReserve(
 				{ accountId: candidate.accountId, modelId: candidate.modelId, estimatedTokens },

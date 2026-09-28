@@ -86,6 +86,8 @@ export interface Candidate {
 	ciScore: number | null;
 	qualityScores?: import("./benchmarks.ts").ModelScore;
 	freeBasis?: "catalog" | "entitlement" | "provider_category";
+	/** Per-capability probe verification; absent/false = assumed, gets the benefit of the doubt. */
+	capsProbed?: { tools: boolean; vision: boolean };
 	/** Advertised context window in tokens (best-effort). */
 	contextWindow: number;
 	/** Capabilities this model advertises. */

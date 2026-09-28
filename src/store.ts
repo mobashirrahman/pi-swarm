@@ -10,6 +10,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import type { AgentSpec, AgentState } from "./agent.ts";
+import type { CapabilityRecord } from "./capabilities.ts";
 
 export interface AgentRow {
 	agentId: string;
@@ -102,6 +103,14 @@ export class AgentStore {
 				error_class TEXT,
 				started_at INTEGER NOT NULL,
 				finished_at INTEGER
+			);
+			CREATE TABLE IF NOT EXISTS model_capabilities (
+				account_id TEXT NOT NULL,
+				model_id TEXT NOT NULL,
+				tools INTEGER,
+				vision INTEGER,
+				probed_at INTEGER NOT NULL,
+				PRIMARY KEY (account_id, model_id)
 			);
 		`);
 		// Older databases were created before tool failures stored their class.
@@ -205,6 +214,28 @@ export class AgentStore {
 
 	recordIdempotency(key: string, agentId: string, now: number): void {
 		this.db.prepare("INSERT OR IGNORE INTO idempotency (key, agent_id, created_at) VALUES (?, ?, ?)").run(key, agentId, now);
+	}
+
+	// =========================================================================
+	// Model capabilities (probe cache)
+	// =========================================================================
+
+	getCapability(accountId: string, modelId: string): CapabilityRecord | undefined {
+		const row = this.db.prepare("SELECT tools, vision, probed_at FROM model_capabilities WHERE account_id = ? AND model_id = ?").get(accountId, modelId) as
+			| { tools: number | null; vision: number | null; probed_at: number }
+			| undefined;
+		if (!row) return undefined;
+		return {
+			probedAt: row.probed_at,
+			...(row.tools !== null ? { tools: row.tools === 1 } : {}),
+			...(row.vision !== null ? { vision: row.vision === 1 } : {}),
+		};
+	}
+
+	setCapability(accountId: string, modelId: string, record: CapabilityRecord): void {
+		this.db
+			.prepare("INSERT OR REPLACE INTO model_capabilities (account_id, model_id, tools, vision, probed_at) VALUES (?, ?, ?, ?, ?)")
+			.run(accountId, modelId, record.tools === undefined ? null : record.tools ? 1 : 0, record.vision === undefined ? null : record.vision ? 1 : 0, record.probedAt);
 	}
 
 	// =========================================================================

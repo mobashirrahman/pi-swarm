@@ -123,7 +123,9 @@ function eligibilityFailure(candidate: Candidate, ctx: SelectorContext, req: Tur
 	if (req.excludeAccounts?.has(candidate.accountId)) return "already_tried";
 	if (!candidate.capabilities.text) return "no_text";
 	for (const cap of req.capabilities) {
-		if (!candidate.capabilities[cap]) return `missing_capability_${cap}`;
+		if (candidate.capabilities[cap]) continue;
+		if (cap !== "text" && candidate.capsProbed?.[cap] !== true) continue;
+		return `missing_capability_${cap}`;
 	}
 	if (candidate.contextWindow > 0 && candidate.contextWindow < req.minimumContextTokens) {
 		return "context_window";
