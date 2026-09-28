@@ -133,7 +133,7 @@ or Codex lists `swarm` with 9 tools), then ask it to:
 
 ## Status
 
-**All phases of the plan are implemented and verified.** 201 tests green.
+**All phases of the plan are implemented and verified.** 204 tests green.
 
 | Phase | Scope | State |
 | --- | --- | --- |

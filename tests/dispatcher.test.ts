@@ -51,6 +51,24 @@ describe("Dispatcher turn execution", () => {
 		expect(candidates[0]?.accountId).toBe("a:1");
 	});
 
+	it("loads catalogs concurrently, in order, tolerating failures", async () => {
+		registry.register(account("a:1", "alpha"));
+		registry.register(account("b:1", "beta"));
+		registry.register(account("c:1", "gamma"));
+		const dispatcher = new Dispatcher({
+			accounts: registry,
+			fetchModels: async (acc) => {
+				if (acc.accountId === "b:1") throw new Error("dead provider");
+				await new Promise((resolve) => setTimeout(resolve, 50));
+				return models(acc.providerId, [`m-${acc.accountId}`]);
+			},
+		});
+		const started = Date.now();
+		const candidates = await dispatcher.loadCandidates();
+		expect(Date.now() - started).toBeLessThan(150);
+		expect(candidates.map((c) => c.accountId)).toEqual(["a:1", "c:1"]);
+	});
+
 	it("estimateTokens counts content characters at ~4 chars/token", () => {
 		const messages: ChatMessage[] = [
 			{ role: "system", content: "abcd".repeat(25) }, // 100 chars → 25 tokens

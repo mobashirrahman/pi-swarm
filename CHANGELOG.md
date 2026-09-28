@@ -2,6 +2,11 @@
 
 All notable changes to pi-swarm are documented here.
 
+## [1.1.2] - 2026-09-28
+
+- Load provider catalogs concurrently: cold start with a full key file drops
+  from ~22s to ~7s, inside MCP client health-check timeouts.
+
 ## [1.1.1] - 2026-09-28
 
 - Fix `npx -y pi-swarm-mcp`: the published bins now include the

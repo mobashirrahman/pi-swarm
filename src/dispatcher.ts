@@ -154,14 +154,18 @@ export class Dispatcher {
 
 	/** Build the routable candidate set from enabled accounts + catalogs. */
 	async loadCandidates(): Promise<Candidate[]> {
+		const enabled = this.accounts.enabled();
+		const fetched = await Promise.all(
+			enabled.map(async (account) => {
+				try {
+					return { account, models: await this.fetchModels(account) };
+				} catch {
+					return { account, models: [] as WireModel[] };
+				}
+			}),
+		);
 		const candidates: Candidate[] = [];
-		for (const account of this.accounts.enabled()) {
-			let models: WireModel[];
-			try {
-				models = await this.fetchModels(account);
-			} catch {
-				continue;
-			}
+		for (const { account, models } of fetched) {
 			// Chat-capable models only (image/video generators share the endpoint).
 			const chatModels = models.filter((model) => wireModelIsChat(model));
 			// Anonymous accounts: restrict to the keyless-usable tier. The tier
