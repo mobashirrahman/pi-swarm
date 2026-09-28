@@ -12,11 +12,25 @@ native tools.
 | `swarm_wait` | Block until the agent finishes; returns its answer |
 | `swarm_status` | Current state, final answer / failure reason, event trail |
 | `swarm_cancel` | Cancel an agent and every agent it spawned |
+| `swarm_plan` | Fan out 1–10 subtasks as concurrent child agents; returns a plan id |
+| `swarm_gather` | Block until the plan's children finish; returns every answer |
 | `swarm_capacity` | Per-account circuit state, in-flight turns, remaining quota |
 | `swarm_models` | Routing view: which model serves next, and why |
 | `swarm_reset` | Close circuits + clear model bans (recover without restart) |
 
 Agents are exposed as `mcp__swarm_<tool>` (e.g. `mcp__swarm_spawn`).
+
+## Fanning out a big task
+
+One call fans out; one call collects. Children share the goal for context,
+run on the best available free backends, and cancel as a tree (`swarm_cancel`
+on any child — or the plan id — reaps its siblings):
+
+1. `swarm_plan` with a `goal`, 1–10 `subtasks`, and optional `defaults`
+   (e.g. `tierHint: "fast"` for cheap subtasks) → `{ planId, childIds }`.
+2. `swarm_gather` with the `planId` → `{ state, children: [{ agentId,
+   state, finalContent }] }`. Like `swarm_wait`, it returns `timedOut: true`
+   instead of blocking past the client's timeout — just call it again.
 
 ## Oh My Pi
 

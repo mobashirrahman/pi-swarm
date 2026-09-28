@@ -9,6 +9,8 @@ import { handleMessage } from "../src/mcp-server.ts";
 
 interface FakeBackend {
 	spawn(args: Record<string, unknown>): Promise<{ agentId: string; duplicate: boolean }>;
+	plan(args: Record<string, unknown>): Promise<{ planId: string; childIds: string[]; duplicate: boolean }>;
+	gather(planId: string, timeoutMs: number | undefined): Promise<unknown>;
 	status(agentId: string): Promise<{ state: string; finalContent?: string | undefined; failReason?: string | undefined; events: string[] }>;
 	cancel(agentId: string): Promise<boolean>;
 	capacity(): Promise<unknown>;
@@ -19,6 +21,8 @@ interface FakeBackend {
 function fakeBackend(overrides: Partial<FakeBackend> = {}): FakeBackend {
 	return {
 		spawn: async (args) => ({ agentId: `agent-for-${String(args["task"]).slice(0, 8)}`, duplicate: false }),
+		plan: async () => ({ planId: "plan-1", childIds: ["agent-1"], duplicate: false }),
+		gather: async (planId) => ({ planId, state: "completed", children: [] }),
 		status: async () => ({ state: "completed", finalContent: "42", events: ["agent.queued", "agent.completed"] }),
 		cancel: async () => true,
 		capacity: async () => [{ accountId: "fake:primary", circuit: "closed" }],
@@ -58,7 +62,7 @@ describe("MCP protocol contract", () => {
 			tools: Array<{ name: string; description: string; inputSchema: { type: string; required?: string[] } }>;
 		};
 		const names = result.tools.map((tool) => tool.name);
-		expect(names).toEqual(["swarm_spawn", "swarm_wait", "swarm_status", "swarm_cancel", "swarm_capacity", "swarm_models", "swarm_reset"]);
+		expect(names).toEqual(["swarm_spawn", "swarm_wait", "swarm_status", "swarm_cancel", "swarm_plan", "swarm_gather", "swarm_capacity", "swarm_models", "swarm_reset"]);
 		for (const tool of result.tools) {
 			expect(tool.description.length).toBeGreaterThan(10);
 			expect(tool.inputSchema.type).toBe("object");

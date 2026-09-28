@@ -24,7 +24,7 @@ import { lookupModelScore } from "./benchmarks.ts";
 import type { TelemetryStore } from "./telemetry.ts";
 import type { LeaseStore, TurnLease } from "./leases.ts";
 import type { HeaderQuota } from "./quota-headers.ts";
-import type { Candidate, QualityMetric, TierHint } from "./types.ts";
+import { bucketKey, type Candidate, type QualityMetric, type TierHint } from "./types.ts";
 
 const _logger = createLogger("dispatcher");
 
@@ -290,6 +290,16 @@ export class Dispatcher {
 		};
 	}
 
+	private isProbationBlock(accountId: string, blockKey: string): boolean {
+		return this.quota
+			.getAccountBuckets(accountId)
+			.some(
+				(bucket) =>
+					bucket.confidence === "unknown" &&
+					bucketKey(accountId, bucket.scope, bucket.metric, bucket.window, bucket.modelId) === blockKey,
+			);
+	}
+
 	/**
 	 * Is the empty selection caused by something that heals on its own?
 	 * Circuit cooldowns and soft-ban TTLs expire; hard bans (max strikes)
@@ -449,6 +459,10 @@ export class Dispatcher {
 				if (blockKey.endsWith("concurrency") && Date.now() < turnDeadline) {
 					await sleep(2_000);
 					continue; // capacity returns on its own; keep candidate eligible
+				}
+				if (this.isProbationBlock(candidate.accountId, blockKey) && Date.now() < turnDeadline) {
+					await sleep(2_000);
+					continue;
 				}
 				excludeAccounts.add(candidate.accountId);
 				continue;

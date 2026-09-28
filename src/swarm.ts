@@ -41,6 +41,50 @@ export interface SpawnResult {
 	duplicate: boolean;
 }
 
+export const MAX_PLAN_CHILDREN = 10;
+
+export interface PlanSubtask {
+	task: string;
+	system?: string | undefined;
+	capabilities?: AgentSpec["capabilities"];
+	tierHint?: TierHint;
+	qualityMetric?: QualityMetric;
+	qualityFloor?: number | null;
+	allowUnknownQuality?: boolean;
+	maxTurns?: number;
+	maxWallTimeMs?: number;
+	maxProviderAttemptsPerTurn?: number;
+	idempotencyKey?: string | undefined;
+}
+
+export interface PlanRequest {
+	goal?: string | undefined;
+	subtasks: PlanSubtask[];
+	defaults?: Omit<PlanSubtask, "task" | "idempotencyKey">;
+	idempotencyKey?: string | undefined;
+}
+
+export interface PlanSpawnResult {
+	planId: string;
+	childIds: string[];
+	/** True when an existing plan satisfied the idempotency key. */
+	duplicate: boolean;
+}
+
+export interface PlanChildResult {
+	agentId: string;
+	state: string;
+	finalContent?: string | undefined;
+	failReason?: string | undefined;
+}
+
+export interface PlanGatherResult {
+	planId: string;
+	state: "completed" | "failed" | "running";
+	timedOut?: boolean | undefined;
+	children: PlanChildResult[];
+}
+
 export interface CapacityView {
 	accountId: string;
 	providerId: string;
@@ -70,6 +114,9 @@ export class SwarmService {
 	private readonly toolExecutor: ToolExecutor;
 	/** Live runtimes + parent links for tree cancellation. */
 	private readonly tree = new CancellationTree();
+	private readonly plans = new Map<string, string[]>();
+	private planCounter = 0;
+	private readonly terminalAgents = new Map<string, { state: AgentState; finalContent?: string | undefined; failReason?: string | undefined }>();
 	/** Per-agent progress events for the SSE endpoint. */
 	private readonly events = new EventBus();
 	/** Sandbox root for workspace tools (undefined = no workspace tools). */
@@ -153,7 +200,7 @@ export class SwarmService {
 
 		if (spec.parentAgentId) {
 			const parentLive = this.tree.live().includes(spec.parentAgentId);
-			const parentKnown = parentLive || this.store?.getAgent(spec.parentAgentId) !== undefined;
+			const parentKnown = parentLive || this.plans.has(spec.parentAgentId) || this.store?.getAgent(spec.parentAgentId) !== undefined;
 			if (!parentKnown) {
 				// Dangling parent link: the child would be unreapable by
 				// parent-cancel. Allow (back-compat) but say so loudly.
@@ -247,6 +294,7 @@ export class SwarmService {
 						const row = this.store.getAgent(spec.agentId);
 						if (row) this.store.upsertAgent({ ...row, state: "cancelled", updatedAt: Date.now() });
 					}
+					this.rememberTerminal(spec.agentId, { state: "cancelled" });
 					this.tree.unregister(spec.agentId);
 				},
 				onComplete: (content) => {
@@ -255,6 +303,7 @@ export class SwarmService {
 						const row = this.store.getAgent(spec.agentId);
 						if (row) this.store.upsertAgent({ ...row, state: "completed", updatedAt: Date.now(), finalContent: content });
 					}
+					this.rememberTerminal(spec.agentId, { state: "completed", finalContent: content });
 					this.tree.unregister(spec.agentId);
 				},
 				onFail: (reason) => {
@@ -263,6 +312,7 @@ export class SwarmService {
 						const row = this.store.getAgent(spec.agentId);
 						if (row) this.store.upsertAgent({ ...row, state: "failed", updatedAt: Date.now(), failReason: reason });
 					}
+					this.rememberTerminal(spec.agentId, { state: "failed", failReason: reason });
 					this.tree.unregister(spec.agentId);
 				},
 			},
@@ -285,7 +335,19 @@ export class SwarmService {
 			const state = runtime.getState();
 			return { agentId, spec: runtime["spec"], state, createdAt: 0, updatedAt: Date.now(), transcript: runtime.getTranscript() };
 		}
+		const terminal = this.terminalAgents.get(agentId);
+		if (terminal) {
+			return { agentId, spec: { task: "", maxTurns: 0, maxWallTimeMs: 0, maxProviderAttemptsPerTurn: 0, capabilities: ["text"], qualityFloor: null, allowUnknownQuality: true, agentId }, state: terminal.state, createdAt: 0, updatedAt: Date.now(), finalContent: terminal.finalContent, failReason: terminal.failReason };
+		}
 		return undefined;
+	}
+
+	private rememberTerminal(agentId: string, terminal: { state: AgentState; finalContent?: string | undefined; failReason?: string | undefined }): void {
+		this.terminalAgents.set(agentId, terminal);
+		if (this.terminalAgents.size > 1000) {
+			const oldest = this.terminalAgents.keys().next().value;
+			if (oldest !== undefined) this.terminalAgents.delete(oldest);
+		}
 	}
 
 	private runtimeFor(agentId: string): AgentRuntime | undefined {
@@ -296,6 +358,77 @@ export class SwarmService {
 	cancelAgent(agentId: string): boolean {
 		const cancelled = this.tree.cancelTree(agentId);
 		return cancelled.length > 0;
+	}
+
+	spawnPlan(request: PlanRequest, now: number = Date.now()): PlanSpawnResult {
+		if (request.subtasks.length < 1 || request.subtasks.length > MAX_PLAN_CHILDREN) {
+			throw new Error(`plan needs 1..${MAX_PLAN_CHILDREN} subtasks, got ${request.subtasks.length}`);
+		}
+		if (request.idempotencyKey && this.store) {
+			const existing = this.store.checkIdempotency(`plan:${request.idempotencyKey}`);
+			if (existing) return { planId: existing, childIds: this.planChildren(existing), duplicate: true };
+		}
+
+		this.planCounter += 1;
+		const planId = `plan-${now.toString(36)}-${this.planCounter}`;
+		this.plans.set(planId, []);
+		const childIds: string[] = [];
+		for (let index = 0; index < request.subtasks.length; index++) {
+			const subtask = request.subtasks[index] as PlanSubtask;
+			const { idempotencyKey, ...overrides } = subtask;
+			const merged: Record<string, unknown> = { ...request.defaults, ...overrides };
+			for (const key of Object.keys(merged)) {
+				if (merged[key] === undefined) delete merged[key];
+			}
+			const spawned = this.spawnAgent(
+				{
+					spec: {
+						...merged,
+						task: request.goal !== undefined ? `${request.goal}\n\nSubtask ${index + 1}/${request.subtasks.length}: ${subtask.task}` : subtask.task,
+						parentAgentId: planId,
+					} as Omit<AgentSpec, "agentId">,
+					idempotencyKey,
+				},
+				now,
+			);
+			childIds.push(spawned.agentId);
+		}
+		this.plans.set(planId, childIds);
+		if (this.store && request.idempotencyKey) {
+			this.store.recordIdempotency(`plan:${request.idempotencyKey}`, planId, now);
+		}
+		this.events.emit(planId, "plan.spawned", { children: childIds.length });
+		return { planId, childIds, duplicate: false };
+	}
+
+	planChildren(planId: string): string[] {
+		const indexed = this.plans.get(planId);
+		if (indexed) return [...indexed];
+		if (!this.store) return [];
+		return this.store.listAgents().filter((row) => row.spec.parentAgentId === planId).map((row) => row.agentId);
+	}
+
+	async gatherPlan(planId: string, timeoutMs = 20_000): Promise<PlanGatherResult> {
+		const deadline = Date.now() + timeoutMs;
+		for (;;) {
+			const children = this.planChildren(planId).map((agentId) => {
+				const agent = this.getAgent(agentId);
+				return {
+					agentId,
+					state: agent?.state ?? "unknown",
+					...(agent?.finalContent !== undefined ? { finalContent: agent.finalContent } : {}),
+					...(agent?.failReason !== undefined ? { failReason: agent.failReason } : {}),
+				};
+			});
+			const settled = children.filter((child) => child.state === "completed" || child.state === "failed" || child.state === "cancelled");
+			if (settled.length === children.length && children.length > 0) {
+				const failed = settled.filter((child) => child.state !== "completed").length;
+				this.events.emit(planId, failed === 0 ? "plan.completed" : "plan.failed", { children: children.length, failed });
+				return { planId, state: failed === 0 ? "completed" : "failed", children };
+			}
+			if (Date.now() >= deadline) return { planId, state: "running", timedOut: true, children };
+			await new Promise((resolve) => setTimeout(resolve, 500));
+		}
 	}
 
 	/**

@@ -22,7 +22,10 @@ export type AgentEventType =
 	| "model.changed"
 	| "agent.completed"
 	| "agent.failed"
-	| "agent.cancelled";
+	| "agent.cancelled"
+	| "plan.spawned"
+	| "plan.completed"
+	| "plan.failed";
 
 export interface AgentEvent {
 	/** Monotonic per-process sequence for ordering + SSE `id:` resume. */

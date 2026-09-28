@@ -290,6 +290,10 @@ curl -X POST localhost:7463/v1/agents -H 'Content-Type: application/json' \
 # status / cancel / capacity / events / recovery
 curl localhost:7463/v1/agents/<id>
 curl -X DELETE localhost:7463/v1/agents/<id>
+# fan-out: 1-10 subtasks as child agents, then gather their answers
+curl -X POST localhost:7463/v1/plans -H 'Content-Type: application/json' \
+  -d '{"goal":"Compare pricing","subtasks":[{"task":"Check provider A"},{"task":"Check provider B"}]}'
+curl "localhost:7463/v1/plans/<planId>?timeoutMs=20000"
 curl localhost:7463/v1/capacity
 curl -N localhost:7463/v1/agents/<id>/events        # SSE; ?since=<seq> resumes
 # after a credential rotation or a false-positive trip (no restart needed):

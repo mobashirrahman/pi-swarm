@@ -24,7 +24,7 @@ import { recoverInterrupted } from "./recovery.ts";
 import { loadConfiguredEnvFile } from "./env-file.ts";
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { parseSpec } from "./server.ts";
+import { parsePlanRequest, parseSpec } from "./server.ts";
 
 const SERVER_NAME = "pi-swarm";
 const SERVER_VERSION = "1.0.0";
@@ -127,6 +127,76 @@ const TOOLS: ToolDefinition[] = [
 		},
 	},
 	{
+		name: "swarm_plan",
+		description:
+			"Fan out one goal into concurrent background subagents (1-10 subtasks). Returns immediately with a plan id and child agent ids; children run on the best available free backends and cancel as a tree. Use swarm_gather to collect their answers.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				goal: { type: "string", description: "Overall goal, prepended to every subtask for context." },
+				subtasks: {
+					type: "array",
+					items: {
+						type: "object",
+						properties: {
+							task: { type: "string", description: "The subtask prompt." },
+							system: { type: "string", description: "Optional system prompt." },
+							capabilities: {
+								type: "array",
+								items: { type: "string", enum: ["text", "vision", "tools"] },
+							},
+							maxTurns: { type: "number" },
+							maxWallTimeMs: { type: "number" },
+							maxProviderAttemptsPerTurn: { type: "number" },
+							tierHint: { type: "string", enum: ["fast", "balanced", "frontier"] },
+							qualityMetric: { type: "string", enum: ["codingIndex", "intelligenceIndex", "agenticIndex"] },
+							qualityFloor: { type: "number" },
+							allowUnknownQuality: { type: "boolean" },
+							idempotencyKey: { type: "string" },
+						},
+						required: ["task"],
+					},
+					description: "Subtasks to run concurrently (1-10).",
+				},
+				defaults: {
+					type: "object",
+					description: "Spec fields applied to every subtask unless overridden.",
+					properties: {
+						capabilities: {
+							type: "array",
+							items: { type: "string", enum: ["text", "vision", "tools"] },
+						},
+						maxTurns: { type: "number" },
+						maxWallTimeMs: { type: "number" },
+						maxProviderAttemptsPerTurn: { type: "number" },
+						tierHint: { type: "string", enum: ["fast", "balanced", "frontier"] },
+						qualityMetric: { type: "string", enum: ["codingIndex", "intelligenceIndex", "agenticIndex"] },
+						qualityFloor: { type: "number" },
+						allowUnknownQuality: { type: "boolean" },
+					},
+				},
+				idempotencyKey: { type: "string", description: "Dedupe key — re-planning with the same key returns the existing plan." },
+			},
+			required: ["subtasks"],
+		},
+	},
+	{
+		name: "swarm_gather",
+		description:
+			"Collect a plan's child results. Returns {state, children[]} on completion, or {state: \"running\", timedOut: true} if the wait window elapsed — in that case simply call swarm_gather again.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				planId: { type: "string", description: "Plan id returned by swarm_plan." },
+				timeoutMs: {
+					type: "number",
+					description: `How long to wait before returning timedOut (default ${DEFAULT_WAIT_TIMEOUT_MS}; keep under your MCP client's request timeout).`,
+				},
+			},
+			required: ["planId"],
+		},
+	},
+	{
 		name: "swarm_capacity",
 		description: "Show per-account provider capacity: circuit state, in-flight turns, and remaining quota where known.",
 		inputSchema: { type: "object", properties: {} },
@@ -162,6 +232,8 @@ const TOOLS: ToolDefinition[] = [
 
 interface SwarmBackend {
 	spawn(args: Record<string, unknown>): Promise<{ agentId: string; duplicate: boolean }>;
+	plan(args: Record<string, unknown>): Promise<{ planId: string; childIds: string[]; duplicate: boolean }>;
+	gather(planId: string, timeoutMs: number | undefined): Promise<unknown>;
 	status(agentId: string): Promise<{ state: string; finalContent?: string | undefined; failReason?: string | undefined; events: string[] }>;
 	cancel(agentId: string): Promise<boolean>;
 	capacity(): Promise<unknown>;
@@ -178,6 +250,14 @@ class EmbeddedBackend implements SwarmBackend {
 			spec: parseSpec(args),
 			idempotencyKey: args["idempotencyKey"] !== undefined ? String(args["idempotencyKey"]) : undefined,
 		});
+	}
+
+	async plan(args: Record<string, unknown>): Promise<{ planId: string; childIds: string[]; duplicate: boolean }> {
+		return this.service.spawnPlan(parsePlanRequest(args));
+	}
+
+	async gather(planId: string, timeoutMs: number | undefined): Promise<unknown> {
+		return this.service.gatherPlan(planId, timeoutMs);
 	}
 
 	async status(agentId: string): Promise<{ state: string; finalContent?: string | undefined; failReason?: string | undefined; events: string[] }> {
@@ -239,6 +319,23 @@ class HttpBackend implements SwarmBackend {
 			}),
 		});
 		return (await response.json()) as { agentId: string; duplicate: boolean };
+	}
+
+	async plan(args: Record<string, unknown>): Promise<{ planId: string; childIds: string[]; duplicate: boolean }> {
+		const response = await fetch(`${this.baseUrl}/v1/plans`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(args),
+		});
+		if (!response.ok) throw new Error(`plan rejected: ${response.status}`);
+		return (await response.json()) as { planId: string; childIds: string[]; duplicate: boolean };
+	}
+
+	async gather(planId: string, timeoutMs: number | undefined): Promise<unknown> {
+		const query = timeoutMs !== undefined ? `?timeoutMs=${Number(timeoutMs)}` : "";
+		const response = await fetch(`${this.baseUrl}/v1/plans/${encodeURIComponent(planId)}${query}`);
+		if (!response.ok) throw new Error(`gather failed: ${response.status}`);
+		return await response.json();
 	}
 
 	async status(agentId: string): Promise<{ state: string; finalContent?: string | undefined; failReason?: string | undefined; events: string[] }> {
@@ -314,6 +411,15 @@ async function callTool(backend: SwarmBackend, name: string, args: Record<string
 		case "swarm_spawn": {
 			const result = await backend.spawn(args);
 			return JSON.stringify(result);
+		}
+		case "swarm_plan": {
+			const result = await backend.plan(args);
+			return JSON.stringify(result);
+		}
+		case "swarm_gather": {
+			const planId = String(args["planId"] ?? "");
+			const timeoutMs = args["timeoutMs"] !== undefined ? Number(args["timeoutMs"]) : undefined;
+			return JSON.stringify(await backend.gather(planId, timeoutMs));
 		}
 		case "swarm_status": {
 			const status = await backend.status(String(args["agentId"] ?? ""));

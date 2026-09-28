@@ -16,6 +16,7 @@ import { AgentStore } from "./store.ts";
 import { SwarmService } from "./swarm.ts";
 import type { AgentSpec } from "./agent.ts";
 import type { QualityMetric, TierHint } from "./types.ts";
+import { MAX_PLAN_CHILDREN, type PlanRequest, type PlanSubtask } from "./swarm.ts";
 import { SqliteLeaseStore } from "./leases.ts";
 import { Workspace } from "./workspace.ts";
 import { recoverInterrupted } from "./recovery.ts";
@@ -62,6 +63,36 @@ export function parseSpec(input: Record<string, unknown>): Omit<AgentSpec, "agen
 	return spec;
 }
 
+function parsePlanOverrides(input: Record<string, unknown>): Omit<PlanSubtask, "task" | "idempotencyKey"> {
+	const spec = parseSpec({ ...input, task: "plan" });
+	const { task: _task, agentId: _agentId, parentAgentId: _parent, ...overrides } = spec as Record<string, unknown>;
+	return overrides as Omit<PlanSubtask, "task" | "idempotencyKey">;
+}
+
+export function parsePlanRequest(input: Record<string, unknown>): PlanRequest {
+	const subtasks = input["subtasks"];
+	if (!Array.isArray(subtasks) || subtasks.length < 1 || subtasks.length > MAX_PLAN_CHILDREN) {
+		throw new Error(`plan needs 1..${MAX_PLAN_CHILDREN} subtasks`);
+	}
+	return {
+		...(typeof input["goal"] === "string" ? { goal: input["goal"] } : {}),
+		subtasks: subtasks.map((entry) => {
+			if (typeof entry !== "object" || entry === null) throw new Error("plan subtask must be an object");
+			const record = entry as Record<string, unknown>;
+			if (typeof record["task"] !== "string" || record["task"].length === 0) throw new Error("plan subtask needs a non-empty task");
+			return {
+				...parsePlanOverrides(record),
+				task: record["task"],
+				...(typeof record["idempotencyKey"] === "string" ? { idempotencyKey: record["idempotencyKey"] } : {}),
+			};
+		}),
+		...(typeof input["defaults"] === "object" && input["defaults"] !== null
+			? { defaults: parsePlanOverrides(input["defaults"] as Record<string, unknown>) }
+			: {}),
+		...(typeof input["idempotencyKey"] === "string" ? { idempotencyKey: input["idempotencyKey"] } : {}),
+	};
+}
+
 async function main(): Promise<number> {
 	// Credentials from PI_SWARM_ENV_FILE, loaded before any provider is seeded.
 	const envReport = loadConfiguredEnvFile();
@@ -104,6 +135,24 @@ async function main(): Promise<number> {
 				const body = JSON.parse(await readBody(req)) as { spec: Record<string, unknown>; idempotencyKey?: string };
 				const result = service.spawnAgent({ spec: parseSpec(body.spec ?? {}), idempotencyKey: body.idempotencyKey });
 				sendJson(res, result.duplicate ? 200 : 201, result);
+				return;
+			}
+			if (req.method === "POST" && url.pathname === "/v1/plans") {
+				const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+				try {
+					const result = service.spawnPlan(parsePlanRequest(body));
+					sendJson(res, result.duplicate ? 200 : 201, result);
+				} catch (error) {
+					sendJson(res, 400, { error: error instanceof Error ? error.message : String(error) });
+				}
+				return;
+			}
+			const planMatch = /^\/v1\/plans\/([^/]+)$/.exec(url.pathname);
+			if (req.method === "GET" && planMatch?.[1]) {
+				const planId = decodeURIComponent(planMatch[1]);
+				const timeoutRaw = url.searchParams.get("timeoutMs");
+				const timeoutMs = timeoutRaw !== null ? Number.parseInt(timeoutRaw, 10) : undefined;
+				sendJson(res, 200, await service.gatherPlan(planId, timeoutMs !== undefined && Number.isFinite(timeoutMs) ? timeoutMs : undefined));
 				return;
 			}
 			const eventsMatch = /^\/v1\/agents\/([^/]+)\/events$/.exec(url.pathname);
