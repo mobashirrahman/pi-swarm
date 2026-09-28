@@ -127,6 +127,7 @@ async function main(): Promise<number> {
 
 	const candidates = await service.refreshCatalogs();
 	_logger.info("swarm_ready", { candidates, port: PORT });
+	service.startAutoRefresh();
 
 	const server = createServer(async (req, res) => {
 		const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);

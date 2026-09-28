@@ -470,6 +470,38 @@ export class SwarmService {
 		});
 	}
 
+	/** Re-resolve refresh interval from the environment (ms). */
+	static refreshIntervalMs(env: NodeJS.ProcessEnv = process.env): number {
+		const raw = Number(env["PI_SWARM_REFRESH_MS"] ?? 3_600_000);
+		return Number.isFinite(raw) && raw > 0 ? raw : 3_600_000;
+	}
+
+	private refreshTimer: ReturnType<typeof setInterval> | undefined;
+	private refreshRunning = false;
+
+	/** Periodically re-fetch scores + catalogs; returns a stop function. Idempotent. */
+	startAutoRefresh(intervalMs: number = SwarmService.refreshIntervalMs()): () => void {
+		if (this.refreshTimer !== undefined) return () => this.stopAutoRefresh();
+		this.refreshTimer = setInterval(() => {
+			if (this.refreshRunning) return;
+			this.refreshRunning = true;
+			this.refreshCatalogs()
+				.catch(() => undefined)
+				.finally(() => {
+					this.refreshRunning = false;
+				});
+		}, intervalMs);
+		this.refreshTimer.unref?.();
+		return () => this.stopAutoRefresh();
+	}
+
+	stopAutoRefresh(): void {
+		if (this.refreshTimer !== undefined) {
+			clearInterval(this.refreshTimer);
+			this.refreshTimer = undefined;
+		}
+	}
+
 	/** Load candidate catalogs (call once at startup, refresh hourly). */
 	async refreshCatalogs(): Promise<number> {
 		// Intelligence scores first, so candidates are scored as they load.

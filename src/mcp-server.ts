@@ -397,6 +397,7 @@ export async function createBackend(): Promise<SwarmBackend> {
 	await workspace.ensure();
 	const service = new SwarmService({ store, workspace, leases: new SqliteLeaseStore(store.database) });
 	await service.refreshCatalogs();
+	service.startAutoRefresh();
 	return new EmbeddedBackend(service);
 }
 

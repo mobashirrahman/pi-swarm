@@ -302,6 +302,9 @@ curl -X POST localhost:7463/v1/capacity/reset -H 'Content-Type: application/json
 # MCP equivalent: swarm_reset (omit accountId to reset all)
 ```
 
+Scores and catalogs re-fetch in the background every hour
+(set `PI_SWARM_REFRESH_MS=1800000` for 30min).
+
 Accounts resolve credentials from env (`LLM7_API_KEY`, `CLINE_API_KEY`,
 `FASTROUTER_API_KEY`, …). Anonymous accounts are restricted to keyless-usable
 tiers (llm7 `turbo`); logged-out accounts whose chat needs a key are excluded
