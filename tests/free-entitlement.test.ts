@@ -63,6 +63,35 @@ describe("strict free-only candidate filtering", () => {
 		expect(candidates.map((c) => c.modelId)).toEqual(["zero-priced"]);
 	});
 
+	it("admits unpriced models on a keyed freemium account", async () => {
+		process.env.PI_SWARM_TEST_FREEMIUM_KEY = "test-key";
+		try {
+			const dispatcher = new Dispatcher({
+				accounts: registry([account({ accountId: "freemium:1", category: "freemium", credentialRef: "PI_SWARM_TEST_FREEMIUM_KEY" })]),
+				fetchModels: async () => models,
+			});
+			const candidates = await dispatcher.loadCandidates();
+			expect(candidates.map((c) => c.modelId)).toEqual(["zero-priced", "unpriced"]);
+			expect(candidates[1]?.freeBasis).toBe("entitlement");
+		} finally {
+			delete process.env.PI_SWARM_TEST_FREEMIUM_KEY;
+		}
+	});
+
+	it("still fails closed for a keyed paid provider with an unpriced catalog", async () => {
+		process.env.PI_SWARM_TEST_PAID_KEY = "test-key";
+		try {
+			const dispatcher = new Dispatcher({
+				accounts: registry([account({ accountId: "paid:1", category: "paid", credentialRef: "PI_SWARM_TEST_PAID_KEY" })]),
+				fetchModels: async () => models,
+			});
+			const candidates = await dispatcher.loadCandidates();
+			expect(candidates.map((c) => c.modelId)).toEqual(["zero-priced"]);
+		} finally {
+			delete process.env.PI_SWARM_TEST_PAID_KEY;
+		}
+	});
+
 	it("fails closed for a paid provider even when the catalog is unpriced", async () => {
 		const dispatcher = new Dispatcher({
 			accounts: registry([account({ accountId: "paid:1", category: "paid" })]),

@@ -10,10 +10,59 @@ generalized from "rescue one session" to "schedule N concurrent agents".
 
 ## Install
 
-Requires **Node.js 22.12+** (`node:sqlite` is built in — no native deps, no
-build step on the user's machine).
+Follow these four steps once per machine. Total time: about five minutes.
 
-**OpenCode** — add to `opencode.json` (project root or
+### 1. Prerequisites
+
+Requires **Node.js 22.12+** (`node:sqlite` is built in — no native deps, no
+build step on the user's machine):
+
+```bash
+node --version
+```
+
+### 2. Collect free provider keys
+
+The swarm's power is breadth: every free-tier key you add is another backend
+to route across. Put them in one secrets file (values never leave the
+process, and never commit this file):
+
+```bash
+# ~/.pi-swarm.env
+CLINE_API_KEY=...
+OPENROUTER_FREE_API_KEY=...
+NVIDIA_API_KEY=...
+GEMINI_API_KEY=...
+```
+
+Without keys the swarm runs on the anonymous tier where available (degraded —
+expect 401 churn on some models). Check which of your keys work:
+
+```bash
+npx -y pi-swarm-mcp < /dev/null; echo "exit: $?"
+```
+
+It must print `exit: 0` (diagnostics go to stderr; stdout carries MCP
+frames only).
+
+### 3. Register the server in your agent client
+
+Use the **same command everywhere** (`npx -y pi-swarm-mcp`) and point
+`PI_SWARM_ENV_FILE` at your secrets file with an **absolute** path.
+Sharing one `PI_SWARM_DB` and `PI_SWARM_WORKSPACE` across clients shares a
+single swarm (capacity leases coordinate across processes).
+
+**Claude Code:**
+
+```bash
+claude mcp add swarm \
+  --env PI_SWARM_ENV_FILE=/absolute/path/to/.pi-swarm.env \
+  --env PI_SWARM_DB=/absolute/path/to/.pi-swarm.db \
+  --env PI_SWARM_WORKSPACE=/absolute/path/to/.pi-swarm-workspace \
+  -- npx -y pi-swarm-mcp
+```
+
+**OpenCode** — `opencode.json` (project root or
 `~/.config/opencode/opencode.json`):
 
 ```json
@@ -23,55 +72,64 @@ build step on the user's machine).
     "swarm": {
       "type": "local",
       "command": ["npx", "-y", "pi-swarm-mcp"],
-      "timeout": 60000
+      "timeout": 60000,
+      "environment": {
+        "PI_SWARM_ENV_FILE": "/absolute/path/to/.pi-swarm.env",
+        "PI_SWARM_DB": "/absolute/path/to/.pi-swarm.db",
+        "PI_SWARM_WORKSPACE": "/absolute/path/to/.pi-swarm-workspace"
+      }
     }
   }
 }
 ```
 
-**Claude Code** — one command:
+**Codex CLI** — `~/.codex/config.toml`:
 
-```bash
-claude mcp add swarm -- npx -y pi-swarm-mcp
+```toml
+[mcp_servers.swarm]
+command = "npx"
+args = ["-y", "pi-swarm-mcp"]
+
+[mcp_servers.swarm.env]
+PI_SWARM_ENV_FILE = "/absolute/path/to/.pi-swarm.env"
+PI_SWARM_DB = "/absolute/path/to/.pi-swarm.db"
+PI_SWARM_WORKSPACE = "/absolute/path/to/.pi-swarm-workspace"
 ```
 
-**Oh My Pi / Cursor / VS Code** (`mcpServers` shape):
+**Oh My Pi / Cursor / VS Code** (`mcpServers` shape — project
+`.omp/mcp.json` or user `~/.omp/agent/mcp.json` for Oh My Pi):
 
 ```json
 {
   "mcpServers": {
     "swarm": {
       "command": "npx",
-      "args": ["-y", "pi-swarm-mcp"]
+      "args": ["-y", "pi-swarm-mcp"],
+      "env": {
+        "PI_SWARM_ENV_FILE": "/absolute/path/to/.pi-swarm.env",
+        "PI_SWARM_DB": "/absolute/path/to/.pi-swarm.db",
+        "PI_SWARM_WORKSPACE": "/absolute/path/to/.pi-swarm-workspace"
+      }
     }
   }
 }
-```
-
-No configuration is required: state defaults to `.pi-swarm.db` and
-`.pi-swarm-workspace/` in the working directory. For provider keys, put them
-in one secrets file and point at it (values never leave the process):
-
-```bash
-# ~/.pi-swarm.env
-LLM7_API_KEY=...
-```
-
-```json
-{ "environment": { "PI_SWARM_ENV_FILE": "/absolute/path/to/.pi-swarm.env" } }
-```
-
-Without keys the swarm runs on the anonymous tier where available (degraded —
-expect 401 churn on some models). Check the binary starts (exits 0 on EOF):
-
-```bash
-npx -y pi-swarm-mcp < /dev/null; echo "exit: $?"
 ```
 
 Prefer running from source? Clone the repo and substitute
 `npx -y pi-swarm-mcp` with `npx tsx /path/to/pi-swarm/src/mcp-server.ts`
 (run from the repo so `tsx` resolves). Maintainers should use the release
 check and tagged workflow described in [`CONTRIBUTING.md`](CONTRIBUTING.md).
+
+### 4. Verify
+
+In any client, confirm the server is registered (e.g. `/mcp` in Claude Code
+or Codex lists `swarm` with 9 tools), then ask it to:
+
+1. Call `swarm_capacity` — your keyed accounts should appear with model
+   counts. If only anonymous tiers show up, the env file path is wrong or a
+   variable name is misspelled.
+2. `swarm_spawn` a trivial task and `swarm_wait` for the answer.
+3. `swarm_plan` with 2 subtasks and `swarm_gather` the results.
 
 ## Status
 

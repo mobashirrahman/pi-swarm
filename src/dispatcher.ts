@@ -172,10 +172,11 @@ export class Dispatcher {
 			const usable = anonymous && anonymousTier !== undefined
 				? chatModels.filter((model) => model.tier === undefined || model.tier === anonymousTier)
 				: chatModels;
-		const isFree = (model: WireModel): boolean => {
+			const isFree = (model: WireModel): boolean => {
 				if (model.pricing !== undefined) return wireModelIsFree(model);
 				if (account.category === "free") return true;
 				if (account.category === "paid") return false;
+				if (resolveKey(account) !== undefined) return true;
 				const entitlement = account.freeEntitlement;
 				if (!entitlement) return false;
 				if (entitlement.allModels) return true;
