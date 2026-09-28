@@ -14,6 +14,8 @@ import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { AgentStore } from "./store.ts";
 import { SwarmService } from "./swarm.ts";
+import type { AgentSpec } from "./agent.ts";
+import type { QualityMetric, TierHint } from "./types.ts";
 import { SqliteLeaseStore } from "./leases.ts";
 import { Workspace } from "./workspace.ts";
 import { recoverInterrupted } from "./recovery.ts";
@@ -35,6 +37,29 @@ async function readBody(req: IncomingMessage): Promise<string> {
 	const chunks: Buffer[] = [];
 	for await (const chunk of req) chunks.push(chunk as Buffer);
 	return Buffer.concat(chunks).toString("utf8");
+}
+
+const TIER_HINTS: ReadonlySet<string> = new Set(["fast", "balanced", "frontier"]);
+const QUALITY_METRICS: ReadonlySet<string> = new Set(["codingIndex", "intelligenceIndex", "agenticIndex"]);
+
+export function parseSpec(input: Record<string, unknown>): Omit<AgentSpec, "agentId"> & { agentId?: string | undefined } {
+	const spec: Omit<AgentSpec, "agentId"> & { agentId?: string | undefined } = {
+		task: String(input["task"] ?? ""),
+		maxTurns: Number(input["maxTurns"] ?? 12),
+		maxWallTimeMs: Number(input["maxWallTimeMs"] ?? 600_000),
+		maxProviderAttemptsPerTurn: Number(input["maxProviderAttemptsPerTurn"] ?? 3),
+		capabilities: Array.isArray(input["capabilities"])
+			? (input["capabilities"].filter((c): c is AgentSpec["capabilities"][number] => typeof c === "string") as AgentSpec["capabilities"])
+			: ["text", "tools"],
+		qualityFloor: typeof input["qualityFloor"] === "number" ? input["qualityFloor"] : null,
+		allowUnknownQuality: input["allowUnknownQuality"] === undefined ? true : Boolean(input["allowUnknownQuality"]),
+	};
+	if (typeof input["system"] === "string") spec.system = input["system"];
+	if (typeof input["agentId"] === "string") spec.agentId = input["agentId"];
+	if (typeof input["parentAgentId"] === "string") spec.parentAgentId = input["parentAgentId"];
+	if (typeof input["tierHint"] === "string" && TIER_HINTS.has(input["tierHint"])) spec.tierHint = input["tierHint"] as TierHint;
+	if (typeof input["qualityMetric"] === "string" && QUALITY_METRICS.has(input["qualityMetric"])) spec.qualityMetric = input["qualityMetric"] as QualityMetric;
+	return spec;
 }
 
 async function main(): Promise<number> {
@@ -77,7 +102,7 @@ async function main(): Promise<number> {
 		try {
 			if (req.method === "POST" && url.pathname === "/v1/agents") {
 				const body = JSON.parse(await readBody(req)) as { spec: Record<string, unknown>; idempotencyKey?: string };
-				const result = service.spawnAgent({ spec: body.spec as never, idempotencyKey: body.idempotencyKey });
+				const result = service.spawnAgent({ spec: parseSpec(body.spec ?? {}), idempotencyKey: body.idempotencyKey });
 				sendJson(res, result.duplicate ? 200 : 201, result);
 				return;
 			}

@@ -71,6 +71,10 @@ export function bucketKey(
 // Candidates
 // =============================================================================
 
+export type TierHint = "fast" | "balanced" | "frontier";
+export type QualityMetric = "codingIndex" | "intelligenceIndex" | "agenticIndex";
+export type FreeEntitlement = { models?: readonly string[]; tiers?: readonly string[]; allModels?: boolean };
+
 /** A routable (account, model) pair. */
 export interface Candidate {
 	accountId: string;
@@ -80,6 +84,8 @@ export interface Candidate {
 	name: string;
 	/** Coding Index score, 0–100; null = unscored. */
 	ciScore: number | null;
+	qualityScores?: import("./benchmarks.ts").ModelScore;
+	freeBasis?: "catalog" | "entitlement" | "provider_category";
 	/** Advertised context window in tokens (best-effort). */
 	contextWindow: number;
 	/** Capabilities this model advertises. */

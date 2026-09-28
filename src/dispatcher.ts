@@ -24,7 +24,7 @@ import { lookupModelScore } from "./benchmarks.ts";
 import type { TelemetryStore } from "./telemetry.ts";
 import type { LeaseStore, TurnLease } from "./leases.ts";
 import type { HeaderQuota } from "./quota-headers.ts";
-import type { Candidate } from "./types.ts";
+import type { Candidate, QualityMetric, TierHint } from "./types.ts";
 
 const _logger = createLogger("dispatcher");
 
@@ -167,26 +167,18 @@ export class Dispatcher {
 			const usable = anonymous && anonymousTier !== undefined
 				? chatModels.filter((model) => model.tier === undefined || model.tier === anonymousTier)
 				: chatModels;
-			// Free-first: when the catalog exposes ANY zero-priced chat model,
-			// restrict to those (free-only policy). Catalogs with no free chat
-			// models keep their full list — free/paid enforcement then depends
-			// on the declared category.
-			//
-			// Category guard: a PAID provider whose catalog carries no pricing
-			// cannot be verified free, and the "no pricing ⇒ free" heuristic
-			// would route straight to paid models (OpenAI lists 124 models with
-			// no prices). Only providers declared free/freemium may use the
-			// unpriced-means-free assumption.
-			const unpricedMeansFree = account.category !== "paid";
-			const freeModels = usable.filter((model) => {
-				if (model.pricing === undefined) return unpricedMeansFree;
-				return wireModelIsFree(model);
-			});
-			const visible = freeModels.length > 0 ? freeModels : unpricedMeansFree ? usable : [];
+		const isFree = (model: WireModel): boolean => {
+				if (model.pricing !== undefined) return wireModelIsFree(model);
+				if (account.category === "free") return true;
+				if (account.category === "paid") return false;
+				const entitlement = account.freeEntitlement;
+				if (!entitlement) return false;
+				if (entitlement.allModels) return true;
+				if (entitlement.tiers?.includes(model.tier ?? "")) return true;
+				return entitlement.models?.includes(model.id) ?? false;
+			};
+			const visible = usable.filter(isFree);
 			for (const model of visible) {
-				// Real intelligence score. `undefined` stays null = UNSCORED,
-				// which the selector treats as its own quality band rather than
-				// as a low score.
 				const score = lookupModelScore(model.id, model.name);
 				const quality = score?.codingIndex ?? score?.intelligenceIndex;
 				candidates.push({
@@ -195,6 +187,8 @@ export class Dispatcher {
 					modelId: model.id,
 					name: model.name ?? model.id,
 					ciScore: quality ?? null,
+					qualityScores: score ? { ...score } : undefined,
+					freeBasis: model.pricing !== undefined ? "catalog" : account.category === "free" ? "provider_category" : "entitlement",
 					// Prefer the measured/benchmarked window when the provider
 					// catalog does not publish one.
 					contextWindow: model.context_length ?? score?.contextWindow ?? 0,
@@ -358,6 +352,8 @@ export class Dispatcher {
 			agentId: string;
 			turnIndex: number;
 			capabilities: AgentSpec["capabilities"];
+			tierHint?: TierHint;
+			qualityMetric?: QualityMetric;
 			qualityFloor: number | null;
 			allowUnknownQuality: boolean;
 			maxAttempts: number;
@@ -397,6 +393,8 @@ export class Dispatcher {
 			const requirements: TurnRequirements = {
 				capabilities: opts.capabilities,
 				minimumContextTokens: estimatedTokens,
+				tierHint: opts.tierHint ?? "frontier",
+				qualityMetric: opts.qualityMetric ?? "codingIndex",
 				qualityFloor: opts.qualityFloor,
 				allowUnknownQuality: opts.allowUnknownQuality,
 				allowPaid: false,

@@ -16,7 +16,16 @@
  *   Tie-breaks: success rate → quota headroom → in-flight → stable hash.
  */
 
-import type { Candidate, FailureClass } from "./types.ts";
+import type { Candidate, FailureClass, QualityMetric, TierHint } from "./types.ts";
+
+export const BALANCED_QUALITY_GAP = 5;
+
+export function candidateQuality(candidate: Candidate, metric: QualityMetric = "codingIndex"): number | null {
+	const value = candidate.qualityScores !== undefined
+		? candidate.qualityScores[metric]
+		: metric === "codingIndex" ? candidate.ciScore : undefined;
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100 ? value : null;
+}
 
 // =============================================================================
 // Inputs
@@ -55,6 +64,8 @@ export interface TurnRequirements {
 	/** Minimum context window (tokens) — must fit the transcript estimate. */
 	minimumContextTokens: number;
 	/** Minimum CI score; unscored models are ineligible unless allowed. */
+	tierHint?: TierHint;
+	qualityMetric?: QualityMetric;
 	qualityFloor: number | null;
 	allowUnknownQuality: boolean;
 	/** Free-only unless explicitly enabled. */
@@ -117,7 +128,9 @@ function eligibilityFailure(candidate: Candidate, ctx: SelectorContext, req: Tur
 	if (candidate.contextWindow > 0 && candidate.contextWindow < req.minimumContextTokens) {
 		return "context_window";
 	}
-	if (req.qualityFloor !== null && candidate.ciScore !== null && candidate.ciScore < req.qualityFloor) {
+	const quality = candidateQuality(candidate, req.qualityMetric);
+	if (quality === null && !req.allowUnknownQuality) return "unknown_quality";
+	if (req.qualityFloor !== null && quality !== null && quality < req.qualityFloor) {
 		return "quality_floor";
 	}
 	if (
@@ -197,6 +210,13 @@ export function selectTurnCandidate(
 		}
 	}
 
+	const tier = req.tierHint ?? "frontier";
+	const bestQuality = Math.max(-1, ...eligible.map((candidate) => candidateQuality(candidate, req.qualityMetric) ?? -1));
+	const qualityBand = (candidate: Candidate): number => {
+		const quality = candidateQuality(candidate, req.qualityMetric);
+		if (quality === null) return 2;
+		return tier === "balanced" && quality < bestQuality - BALANCED_QUALITY_GAP ? 1 : 0;
+	};
 	const ranked: RoutedCandidate[] = eligible.map((candidate) => {
 		const nextCapacity = ctx.nextCapacityAt.get(candidate.accountId) ?? 0;
 		const waitMs = Math.max(0, nextCapacity - ctx.now);
@@ -216,6 +236,14 @@ export function selectTurnCandidate(
 	});
 
 	ranked.sort((a, b) => {
+		if (tier !== "fast") {
+			const bandDiff = qualityBand(a.candidate) - qualityBand(b.candidate);
+			if (bandDiff !== 0) return bandDiff;
+			if (tier === "frontier") {
+				const qualityDiff = (candidateQuality(b.candidate, req.qualityMetric) ?? -1) - (candidateQuality(a.candidate, req.qualityMetric) ?? -1);
+				if (qualityDiff !== 0) return qualityDiff;
+			}
+		}
 		if (a.projectedFinishAt !== b.projectedFinishAt) return a.projectedFinishAt - b.projectedFinishAt;
 		// Tie-break 1: success rate.
 		const rateDiff = b.diag.successRate - a.diag.successRate;

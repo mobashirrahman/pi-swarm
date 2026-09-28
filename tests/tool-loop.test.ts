@@ -124,6 +124,7 @@ describe("tool loop end-to-end (fake provider, real HTTP)", () => {
 			enabled: true,
 			maxConcurrency: 2,
 			baseUrl,
+			category: "free",
 		});
 		const dispatcher = new Dispatcher({
 			accounts,

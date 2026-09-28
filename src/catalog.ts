@@ -11,7 +11,7 @@
 
 import { fetchWithRetry } from "./fetch.ts";
 import { createLogger } from "./logger.ts";
-import type { ProviderAccount } from "./types.ts";
+import type { FreeEntitlement, ProviderAccount } from "./types.ts";
 
 const _logger = createLogger("catalog");
 
@@ -20,8 +20,7 @@ export interface WireModel {
 	id: string;
 	/** Some gateways put a display name here. */
 	name?: string | undefined;
-	/** OpenRouter-style per-token pricing; zero/absent ⇒ treated free. */
-	pricing?: { prompt?: string | number; completion?: string | number; input?: string | number; output?: string | number } | undefined;
+	pricing?: Record<string, string | number | undefined> | undefined;
 	context_length?: number | undefined;
 	/** llm7-style model type: "chat" is text-completions capable. */
 	model_type?: string | undefined;
@@ -49,6 +48,7 @@ export interface AccountRegistryEntry extends ProviderAccount {
 	 * would happily route to paid models).
 	 */
 	category?: "free" | "freemium" | "paid" | undefined;
+	freeEntitlement?: FreeEntitlement;
 }
 
 /** In-memory account registry. Persistence arrives with the store layer. */
@@ -116,12 +116,12 @@ export function resolveKey(account: AccountRegistryEntry): string | undefined {
 /** Is a wire model free? Ported pi-free logic: zero prompt AND completion price. */
 export function wireModelIsFree(model: WireModel): boolean {
 	const pricing = model.pricing;
-	if (!pricing) return true; // no pricing info — anonymous catalogs are free-tier
-	const num = (v: string | number | undefined): number | undefined =>
-		typeof v === "string" ? Number.parseFloat(v) : v;
-	const input = num(pricing.prompt ?? pricing.input) ?? 0;
-	const completion = num(pricing.completion ?? pricing.output) ?? 0;
-	return Number.isFinite(input) && Number.isFinite(completion) && input === 0 && completion === 0;
+	if (!pricing) return false;
+	const zero = (value: unknown): boolean =>
+		(typeof value === "number" || (typeof value === "string" && value.trim() !== "")) && Number(value) === 0;
+	return zero(pricing.prompt ?? pricing.input)
+		&& zero(pricing.completion ?? pricing.output)
+		&& Object.values(pricing).every(zero);
 }
 
 /**

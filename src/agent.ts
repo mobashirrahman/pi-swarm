@@ -15,6 +15,7 @@
 
 import { createLogger } from "./logger.ts";
 import type { ChatMessage, TurnOutcome } from "./stream.ts";
+import type { QualityMetric, TierHint } from "./types.ts";
 
 const _logger = createLogger("agent");
 
@@ -38,6 +39,8 @@ export interface AgentSpec {
 	/** Per-turn provider attempt cap. */
 	maxProviderAttemptsPerTurn: number;
 	capabilities: Array<"text" | "vision" | "tools">;
+	tierHint?: TierHint;
+	qualityMetric?: QualityMetric;
 	qualityFloor: number | null;
 	allowUnknownQuality: boolean;
 }
@@ -86,6 +89,8 @@ export class AgentRuntime {
 					agentId: string;
 					turnIndex: number;
 					capabilities: AgentSpec["capabilities"];
+					tierHint?: TierHint;
+					qualityMetric?: QualityMetric;
 					qualityFloor: number | null;
 					allowUnknownQuality: boolean;
 					maxAttempts: number;
@@ -163,6 +168,8 @@ export class AgentRuntime {
 				agentId: this.spec.agentId,
 				turnIndex: turn,
 				capabilities: this.spec.capabilities,
+				tierHint: this.spec.tierHint ?? "frontier",
+				qualityMetric: this.spec.qualityMetric ?? "codingIndex",
 				qualityFloor: this.spec.qualityFloor,
 				allowUnknownQuality: this.spec.allowUnknownQuality,
 				maxAttempts: this.spec.maxProviderAttemptsPerTurn,

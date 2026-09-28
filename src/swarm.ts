@@ -12,7 +12,9 @@
 import { AgentRuntime, type AgentSpec, type AgentState } from "./agent.ts";
 import { AccountRegistry, resolveKey, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
 import { availableSeeds } from "./providers.ts";
+import { candidateQuality } from "./selector.ts";
 import { createLogger } from "./logger.ts";
+import type { QualityMetric, TierHint } from "./types.ts";
 import { Dispatcher } from "./dispatcher.ts";
 import { ToolExecutor, registerBuiltinTools, registerWorkspaceTools } from "./tools.ts";
 import { CancellationTree } from "./cancellation.ts";
@@ -55,6 +57,8 @@ const DEFAULT_SPEC: Omit<AgentSpec, "agentId" | "task"> = {
 	maxWallTimeMs: 600_000,
 	maxProviderAttemptsPerTurn: 3,
 	capabilities: ["text", "tools"],
+	tierHint: "frontier",
+	qualityMetric: "codingIndex",
 	qualityFloor: null,
 	allowUnknownQuality: true,
 };
@@ -369,7 +373,7 @@ export class SwarmService {
 			return {
 				accountId: candidate.accountId,
 				modelId: candidate.modelId,
-				quality: candidate.ciScore,
+				quality: candidateQuality(candidate),
 				latencyMs: telemetry?.latencyMs ?? null,
 				ttftMs: telemetry?.ttftMs ?? null,
 				tokensPerSecond: telemetry?.tokensPerSecond ?? null,
@@ -386,3 +390,4 @@ export class SwarmService {
 }
 
 export type { WireModel };
+export type { TierHint, QualityMetric };

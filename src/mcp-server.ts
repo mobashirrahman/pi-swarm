@@ -24,7 +24,7 @@ import { recoverInterrupted } from "./recovery.ts";
 import { loadConfiguredEnvFile } from "./env-file.ts";
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import type { AgentSpec } from "./agent.ts";
+import { parseSpec } from "./server.ts";
 
 const SERVER_NAME = "pi-swarm";
 const SERVER_VERSION = "1.0.0";
@@ -74,6 +74,18 @@ const TOOLS: ToolDefinition[] = [
 					type: "number",
 					description: "How many provider reroutes per turn (default 3; raise on flaky free tiers).",
 				},
+				tierHint: {
+					type: "string",
+					enum: ["fast", "balanced", "frontier"],
+					description: "Quality routing tier. \"fast\" optimizes projected finish after the quality floor; \"balanced\" keeps models within a small gap of the best available; \"frontier\" (default) picks the highest-quality model first.",
+				},
+				qualityMetric: {
+					type: "string",
+					enum: ["codingIndex", "intelligenceIndex", "agenticIndex"],
+					description: "Which benchmark drives quality routing (default codingIndex).",
+				},
+				qualityFloor: { type: "number", description: "Minimum quality score 0–100; unscored models are rejected unless allowUnknownQuality." },
+				allowUnknownQuality: { type: "boolean", description: "Allow unscored models when a qualityFloor is set (default true)." },
 				parentAgentId: { type: "string", description: "Parent agent id; cancelling the parent cancels this agent." },
 				idempotencyKey: { type: "string", description: "Dedupe key — re-spawning with the same key returns the existing agent." },
 			},
@@ -162,19 +174,8 @@ class EmbeddedBackend implements SwarmBackend {
 	constructor(private readonly service: SwarmService) {}
 
 	async spawn(args: Record<string, unknown>): Promise<{ agentId: string; duplicate: boolean }> {
-		const spec = {
-			task: String(args["task"] ?? ""),
-			...(args["system"] !== undefined ? { system: String(args["system"]) } : {}),
-			...(args["capabilities"] !== undefined ? { capabilities: args["capabilities"] as AgentSpec["capabilities"] } : {}),
-			...(args["maxTurns"] !== undefined ? { maxTurns: Number(args["maxTurns"]) } : {}),
-			...(args["maxWallTimeMs"] !== undefined ? { maxWallTimeMs: Number(args["maxWallTimeMs"]) } : {}),
-			...(args["maxProviderAttemptsPerTurn"] !== undefined
-				? { maxProviderAttemptsPerTurn: Number(args["maxProviderAttemptsPerTurn"]) }
-				: {}),
-			...(args["parentAgentId"] !== undefined ? { parentAgentId: String(args["parentAgentId"]) } : {}),
-		} as unknown as Omit<AgentSpec, "agentId">;
 		return this.service.spawnAgent({
-			spec,
+			spec: parseSpec(args),
 			idempotencyKey: args["idempotencyKey"] !== undefined ? String(args["idempotencyKey"]) : undefined,
 		});
 	}
@@ -228,6 +229,10 @@ class HttpBackend implements SwarmBackend {
 					maxTurns: args["maxTurns"],
 					maxWallTimeMs: args["maxWallTimeMs"],
 					maxProviderAttemptsPerTurn: args["maxProviderAttemptsPerTurn"],
+					tierHint: args["tierHint"],
+					qualityMetric: args["qualityMetric"],
+					qualityFloor: args["qualityFloor"],
+					allowUnknownQuality: args["allowUnknownQuality"],
 					parentAgentId: args["parentAgentId"],
 				},
 				idempotencyKey: args["idempotencyKey"],
