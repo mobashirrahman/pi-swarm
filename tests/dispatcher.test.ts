@@ -11,6 +11,7 @@ function account(id: string, providerId: string): AccountRegistryEntry & { baseU
 		enabled: true,
 		maxConcurrency: 4,
 		baseUrl: `https://${providerId}.test/v1`,
+		category: "free",
 	};
 }
 
@@ -133,5 +134,51 @@ describe("Dispatcher turn execution", () => {
 		expect(outcome.status).toBe(429);
 		// The dispatcher maps 429 → reroute (classifier port).
 		expect(outcome.status === 429 || outcome.status === 402).toBe(true);
+	});
+
+	it("cools a keyed account down with a BOUNDED cooldown after 2 models reject auth", () => {
+		process.env.PI_SWARM_TEST_KEYED = "test-key";
+		try {
+			registry.register({ ...account("k:1", "keyed"), credentialRef: "PI_SWARM_TEST_KEYED" });
+			const dispatcher = new Dispatcher({ accounts: registry, fetchModels: async () => [] });
+			const now = Date.now();
+			dispatcher.blacklist.recordFailure("k:1/m1", "auth", now);
+			expect(dispatcher.maybeCoolDownCredentials(registry.get("k:1")!, "agent-x")).toBe(false);
+			dispatcher.blacklist.recordFailure("k:1/m2", "auth", now + 1);
+			expect(dispatcher.maybeCoolDownCredentials(registry.get("k:1")!, "agent-x")).toBe(true);
+			const circuit = dispatcher.circuit.get("k:1");
+			expect(circuit.state).toBe("open");
+			// Bounded: ~10min, never Number.MAX_SAFE_INTEGER (the old pool suicide).
+			expect(circuit.cooldownUntil).toBeGreaterThan(now);
+			expect(circuit.cooldownUntil).toBeLessThan(now + 11 * 60_000);
+			expect(dispatcher.circuit.canAdmit("k:1", now + 11 * 60_000)).toBe(true);
+		} finally {
+			delete process.env.PI_SWARM_TEST_KEYED;
+		}
+	});
+
+	it("never trips the account circuit for anonymous auth failures (per-model bans only)", () => {
+		registry.register({ ...account("a:9", "anon"), credentialRef: "PI_SWARM_TEST_MISSING_KEY" });
+		const dispatcher = new Dispatcher({ accounts: registry, fetchModels: async () => [] });
+		const now = Date.now();
+		dispatcher.blacklist.recordFailure("a:9/m1", "auth", now);
+		dispatcher.blacklist.recordFailure("a:9/m2", "auth", now + 1);
+		dispatcher.blacklist.recordFailure("a:9/m3", "policy", now + 2);
+		expect(dispatcher.maybeCoolDownCredentials(registry.get("a:9")!, "agent-x")).toBe(false);
+		expect(dispatcher.circuit.get("a:9").state).toBe("closed");
+		expect(dispatcher.circuit.canAdmit("a:9", now)).toBe(true);
+	});
+
+	it("resetAccount closes the circuit and clears the account's bans", () => {
+		registry.register(account("a:1", "alpha"));
+		const dispatcher = new Dispatcher({ accounts: registry, fetchModels: async () => [] });
+		const now = Date.now();
+		dispatcher.circuit.openUntil("a:1", now + 600_000, now);
+		dispatcher.blacklist.recordFailure("a:1/m1", "auth", now);
+		const reset = dispatcher.resetAccount("a:1");
+		expect(reset.clearedBans).toBe(1);
+		expect(dispatcher.circuit.get("a:1").state).toBe("closed");
+		expect(dispatcher.circuit.canAdmit("a:1", now)).toBe(true);
+		expect(dispatcher.blacklist.isBlacklisted("a:1/m1", now)).toBe(false);
 	});
 });

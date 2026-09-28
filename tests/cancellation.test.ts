@@ -73,15 +73,16 @@ describe("cancellation tree", () => {
 		expect(done.cancelCalls).toBe(0);
 	});
 
-	it("unregistering a parent orphans children without crashing", () => {
+	it("reaps live children even when the parent is already terminal (orphans)", () => {
 		const tree = new CancellationTree();
 		const parent = fakeRuntime("p");
 		const child = fakeRuntime("c");
 		tree.register("p", undefined, parent);
 		tree.register("c", "p", child);
-		tree.unregister("p");
-		expect(tree.cancelTree("p")).toEqual([]);
-		expect(child.cancelCalls).toBe(0);
+		tree.unregister("p"); // parent completed; child still live
+		expect(tree.cancelTree("p")).toEqual(["c"]);
+		expect(child.cancelCalls).toBe(1);
+		expect(parent.cancelCalls).toBe(0);
 	});
 
 	it("descendants() lists the live subtree only", () => {

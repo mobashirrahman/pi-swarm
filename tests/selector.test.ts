@@ -119,6 +119,23 @@ describe("selector: stage C projection", () => {
 		expect(result.best?.diag.latencyMs).toBe(30_000);
 	});
 
+	it("unproven candidates inherit the fleet median once anything is measured", () => {
+		const candidates = [
+			candidate({ accountId: "a:1", modelId: "proven" }),
+			candidate({ accountId: "a:1", modelId: "fresh" }),
+		];
+		const ctx = context({
+			ewmaLatencyMs: new Map([
+				["a:1/proven", 2_000],
+				["other:9/z", 4_000],
+			]),
+		});
+		const result = selectTurnCandidate(candidates, ctx, REQ);
+		const fresh = result.ranked.find((r) => r.candidate.modelId === "fresh");
+		// Median of {2000, 4000} = 3000, not the 30s starvation penalty.
+		expect(fresh?.diag.latencyMs).toBe(3_000);
+	});
+
 	it("tie-breaks deterministically via stable hash", () => {
 		const candidates = [
 			candidate({ accountId: "a:1", modelId: "m1", ciScore: 50 }),

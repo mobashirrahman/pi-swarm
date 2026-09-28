@@ -49,12 +49,12 @@ export class CancellationTree {
 
 	/**
 	 * Cancel an agent and every live descendant. Children cancel first.
-	 * Returns all cancelled ids (parent last) — empty when the agent was
-	 * not live.
+	 * A missing parent runtime does NOT stop descendant cancellation: the
+	 * parent may already be terminal while a child is still live (orphan),
+	 * and that child must still be reaped. Returns all cancelled ids
+	 * (parent last) — empty when nothing was live.
 	 */
 	cancelTree(agentId: string): string[] {
-		const runtime = this.runtimes.get(agentId);
-		if (!runtime) return [];
 		const descendants = this.descendants(agentId);
 		const cancelled: string[] = [];
 		for (const child of descendants) {
@@ -64,8 +64,11 @@ export class CancellationTree {
 				cancelled.push(child);
 			}
 		}
-		runtime.cancel();
-		cancelled.push(agentId);
+		const runtime = this.runtimes.get(agentId);
+		if (runtime) {
+			runtime.cancel();
+			cancelled.push(agentId);
+		}
 		return cancelled;
 	}
 
