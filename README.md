@@ -133,7 +133,7 @@ or Codex lists `swarm` with 9 tools), then ask it to:
 
 ## Status
 
-**All phases of the plan are implemented and verified.** 204 tests green.
+**All phases of the plan are implemented and verified.** 213 tests green.
 
 | Phase | Scope | State |
 | --- | --- | --- |
@@ -198,6 +198,11 @@ a turn is spent on them; verdicts cache for 24h in SQLite. Unprobed models
 get the benefit of the doubt at selection, probed denials reroute without
 burning an attempt — so vision turns reach models that actually see, and
 tool turns skip models that provably reject tools.
+
+Probes are treated as real cost: at most 3 per turn, issued inside the
+account's quota reservation and lease, and shared between concurrent agents
+verifying the same model. Past the budget a turn sends on the assumed
+capabilities and lets the response correct the verdict.
 
 ## Workspaces (sandbox boundary)
 
