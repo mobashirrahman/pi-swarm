@@ -14,11 +14,13 @@ function sseText(content: string): string {
 		+ "data: [DONE]\n\n";
 }
 
-function startServer(handler: (body: Record<string, unknown>, res: ServerResponse) => void): Promise<{ server: Server; baseUrl: string }> {
+function startServer(handler: (body: Record<string, unknown>, res: ServerResponse) => void | Promise<void>): Promise<{ server: Server; baseUrl: string }> {
 	const server = createServer((req: IncomingMessage, res: ServerResponse) => {
 		const chunks: Buffer[] = [];
 		req.on("data", (chunk: Buffer) => chunks.push(chunk));
-		req.on("end", () => handler(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>, res));
+		req.on("end", () => {
+			void handler(JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>, res);
+		});
 	});
 	return new Promise((resolve) => {
 		server.listen(0, "127.0.0.1", () => {
@@ -93,6 +95,86 @@ describe("capability cache", () => {
 		const second = new CapabilityCache(store);
 		expect(second.get("a:1", "m")).toEqual({ tools: false, vision: true });
 		expect(store.getCapability("a:9", "missing")).toBeUndefined();
+	});
+});
+
+describe("probe budgeting", () => {
+	function unprobed(accountId: string, modelId: string) {
+		return {
+			accountId, providerId: "mock", modelId, name: modelId, ciScore: null,
+			contextWindow: 128_000, capabilities: { text: true, vision: false, tools: true },
+		};
+	}
+
+	it("issues at most MAX_PROBES_PER_TURN probes and then sends unverified", async () => {
+		const requests: Array<Record<string, unknown>> = [];
+		const { server, baseUrl } = await startServer(async (body, res) => {
+			requests.push(body);
+			// Every probe is refused, so the turn keeps looking for a model.
+			if (body["max_tokens"] === 1) {
+				res.writeHead(400, { "Content-Type": "application/json" });
+				res.end("{}");
+				return;
+			}
+			res.writeHead(200, { "Content-Type": "text/event-stream" });
+			res.end(sseText("done"));
+		});
+		try {
+			const accounts = new AccountRegistry();
+			for (const id of ["mock:a", "mock:b", "mock:c"]) {
+				accounts.register({
+					accountId: id, providerId: "mock", credentialRef: "MOCK_API_KEY",
+					enabled: true, maxConcurrency: 8, baseUrl, category: "free",
+				});
+			}
+			const mod = await import("../src/capabilities.ts");
+			const candidates = Array.from({ length: 30 }, (_, i) => unprobed(`mock:${["a", "b", "c"][i % 3]}`, `m${i}`));
+			const dispatcher = new Dispatcher({ accounts, fetchModels: async () => [] });
+			dispatcher["candidatesCache"] = candidates as never;
+			const result = await dispatcher.executeTurn([{ role: "user", content: "hi" }], {
+				agentId: "budget", turnIndex: 0, capabilities: ["text", "vision"],
+				qualityFloor: null, allowUnknownQuality: true, maxAttempts: 3, signal: AbortSignal.timeout(60_000),
+			});
+			const probes = requests.filter((request) => request["max_tokens"] === 1);
+			expect(probes.length).toBeLessThanOrEqual(mod.MAX_PROBES_PER_TURN);
+			// Unbounded probing previously issued one request per candidate.
+			expect(requests.length).toBeLessThan(candidates.length);
+			expect(result.ok || result.reason).toBeTruthy();
+		} finally {
+			server.close();
+		}
+	});
+
+	it("shares one probe between concurrent turns for the same model", async () => {
+		let probeRequests = 0;
+		const { server, baseUrl } = await startServer(async (body, res) => {
+			if (body["max_tokens"] === 1) {
+				probeRequests += 1;
+				await new Promise((resolve) => setTimeout(resolve, 60));
+				res.writeHead(200, { "Content-Type": "text/event-stream" });
+				res.end(sseText("ok"));
+				return;
+			}
+			res.writeHead(200, { "Content-Type": "text/event-stream" });
+			res.end(sseText("done"));
+		});
+		try {
+			const accounts = new AccountRegistry();
+			accounts.register({
+				accountId: "mock:a", providerId: "mock", credentialRef: "MOCK_API_KEY",
+				enabled: true, maxConcurrency: 8, baseUrl, category: "free",
+			});
+			const dispatcher = new Dispatcher({ accounts, fetchModels: async () => [] });
+			dispatcher["candidatesCache"] = [unprobed("mock:a", "shared-model")] as never;
+			const turn = (agentId: string) => dispatcher.executeTurn([{ role: "user", content: "hi" }], {
+				agentId, turnIndex: 0, capabilities: ["text", "tools"],
+				qualityFloor: null, allowUnknownQuality: true, maxAttempts: 2, signal: AbortSignal.timeout(60_000),
+			});
+			await Promise.all([turn("a1"), turn("a2"), turn("a3")]);
+			expect(probeRequests).toBe(1);
+		} finally {
+			server.close();
+		}
 	});
 });
 

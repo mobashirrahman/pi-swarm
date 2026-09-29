@@ -151,10 +151,83 @@ describe("plan request parsing", () => {
 		expect(parsed.subtasks[0]?.["qualityFloor"]).toBe(70);
 		expect(parsed.subtasks[1]?.["task"]).toBe("b");
 		expect(parsed.idempotencyKey).toBe("k");
+		// Unspecified overrides must stay ABSENT so plan-level defaults win.
+		expect(parsed.subtasks[0]).not.toHaveProperty("maxTurns");
+		expect(parsed.subtasks[0]).not.toHaveProperty("capabilities");
+		expect(parsed.subtasks[1]).toEqual({ task: "b" });
 		expect(() => mod.parsePlanRequest({ subtasks: [] })).toThrow();
 		expect(() => mod.parsePlanRequest({ subtasks: [{ task: "" }] })).toThrow();
 		expect(() => mod.parsePlanRequest({ subtasks: [{ system: "no task" }] })).toThrow();
 		expect(() => mod.parsePlanRequest({ subtasks: Array.from({ length: 11 }, () => ({ task: "t" })) })).toThrow();
+	});
+});
+
+describe("plan runtime limits", () => {
+	let server: Server | undefined;
+
+	afterEach(() => {
+		server?.close();
+		server = undefined;
+	});
+
+	it("applies plan defaults to children that omit them, honoring subtask overrides", async () => {
+		const started = await startMockProvider(() => ({ content: "child" }));
+		server = started.server;
+		const service = new SwarmService({
+			accounts: [account(started.baseUrl, "mock:a"), account(started.baseUrl, "mock:b")],
+		});
+		service.dispatcher["candidatesCache"] = [candidate("mock:a"), candidate("mock:b")];
+		const plan = service.spawnPlan({
+			subtasks: [{ task: "a" }, { task: "b", maxTurns: 2 }],
+			defaults: { capabilities: ["text"], maxTurns: 1, maxWallTimeMs: 30_000 },
+		});
+		const specs = plan.childIds.map((id) => service.getAgent(id)?.spec);
+		expect(specs[0]?.capabilities).toEqual(["text"]);
+		expect(specs[0]?.maxTurns).toBe(1);
+		expect(specs[0]?.maxWallTimeMs).toBe(30_000);
+		expect(specs[1]?.maxTurns).toBe(2);
+		const gathered = await service.gatherPlan(plan.planId, 30_000);
+		expect(gathered.state).toBe("completed");
+	});
+
+	it("returns instead of polling forever on a non-finite timeout", async () => {
+		const started = await startMockProvider(() => ({ content: "never", hold: true }));
+		server = started.server;
+		const service = new SwarmService({ accounts: [account(started.baseUrl, "mock:a")] });
+		service.dispatcher["candidatesCache"] = [candidate("mock:a")];
+		const plan = service.spawnPlan({ subtasks: [{ task: "a" }] });
+		// NaN falls back to the default budget (20s), not an endless loop.
+		const at = Date.now();
+		const gathered = await service.gatherPlan(plan.planId, Number.NaN);
+		const elapsed = Date.now() - at;
+		expect(elapsed).toBeGreaterThanOrEqual(19_000);
+		expect(elapsed).toBeLessThan(26_000);
+		expect(gathered.state).toBe("running");
+		expect(gathered.timedOut).toBe(true);
+		service.cancelAgent(plan.planId);
+	}, 40_000);
+
+	it("fails a plan holding an unreapable child instead of waiting forever", async () => {
+		const started = await startMockProvider(() => ({ content: "x" }));
+		server = started.server;
+		const service = new SwarmService({ accounts: [account(started.baseUrl)] });
+		const at = Date.now();
+		const gathered = await service.gatherPlan("plan-does-not-exist", 30_000);
+		expect(Date.now() - at).toBeLessThan(5_000);
+		expect(gathered.state).not.toBe("running");
+	});
+
+	it("caps concurrent live agents", async () => {
+		const started = await startMockProvider(() => ({ content: "never", hold: true }));
+		server = started.server;
+		const service = new SwarmService({ accounts: [account(started.baseUrl)] });
+		const { MAX_LIVE_AGENTS } = await import("../src/swarm.ts");
+		const spec = () => ({
+			task: "t", maxTurns: 1, maxWallTimeMs: 60_000, maxProviderAttemptsPerTurn: 1,
+			capabilities: ["text" as const], qualityFloor: null, allowUnknownQuality: true,
+		});
+		for (let i = 0; i < MAX_LIVE_AGENTS; i++) service.spawnAgent({ spec: spec() });
+		expect(() => service.spawnAgent({ spec: spec() })).toThrow(/too many live agents/);
 	});
 });
 

@@ -8,6 +8,15 @@ const _logger = createLogger("capabilities");
 export const CAPABILITY_TTL_MS = 24 * 3600 * 1000;
 const PROBE_TIMEOUT_MS = 30_000;
 
+/**
+ * Ceiling on capability probes ONE turn may issue. A turn must never spend
+ * more provider requests verifying models than doing the work: an unbounded
+ * probe fan-out over a large pool is indistinguishable from an attack on a
+ * rate-limited free tier. Past the budget a turn sends on the assumed
+ * capabilities and lets the response correct the verdict.
+ */
+export const MAX_PROBES_PER_TURN = 3;
+
 export interface VerifiedCapabilities {
 	tools?: boolean | undefined;
 	vision?: boolean | undefined;
@@ -39,6 +48,12 @@ function unsupported(status: number | undefined, errorMessage: string): boolean 
 	return classifyFailure(status, errorMessage).cls === "bad_request" ? false : null;
 }
 
+/** Probe requests are bounded well below a real turn's own timeout. */
+export function probeSignal(upstream?: AbortSignal | undefined): AbortSignal {
+	const timeout = AbortSignal.timeout(PROBE_TIMEOUT_MS);
+	return upstream ? AbortSignal.any([upstream, timeout]) : timeout;
+}
+
 export async function probeToolsSupport(endpoint: ProbeEndpoint): Promise<boolean | null> {
 	const outcome = await streamTurn({
 		baseUrl: endpoint.baseUrl,
@@ -47,7 +62,7 @@ export async function probeToolsSupport(endpoint: ProbeEndpoint): Promise<boolea
 		messages: [{ role: "user", content: "Reply with the word ok." }],
 		tools: [PROBE_TOOL],
 		maxTokens: 1,
-		signal: endpoint.signal,
+		signal: probeSignal(endpoint.signal),
 	});
 	if (outcome.ok) return true;
 	return unsupported(outcome.status, outcome.errorMessage);
@@ -79,7 +94,7 @@ export async function probeVisionSupport(endpoint: ProbeEndpoint): Promise<boole
 					],
 					max_tokens: 1,
 				}),
-				signal: endpoint.signal,
+				signal: probeSignal(endpoint.signal),
 			},
 			PROBE_TIMEOUT_MS,
 		);

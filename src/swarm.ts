@@ -44,6 +44,13 @@ export interface SpawnResult {
 
 export const MAX_PLAN_CHILDREN = 10;
 
+/**
+ * Ceiling on concurrent live agents. Plans cap at 10 subtasks, but a client
+ * looping `swarm_spawn` had no bound at all and could drive unbounded
+ * concurrent turns at providers that ration free quota per minute.
+ */
+export const MAX_LIVE_AGENTS = 200;
+
 export interface PlanSubtask {
 	task: string;
 	system?: string | undefined;
@@ -189,10 +196,13 @@ export class SwarmService {
 	// =========================================================================
 
 	spawnAgent(request: SpawnRequest, now: number = Date.now()): SpawnResult {
-		// Idempotency first.
+		// Idempotency first: a deduped respawn must not trip the live cap.
 		if (request.idempotencyKey && this.store) {
 			const existing = this.store.checkIdempotency(request.idempotencyKey);
 			if (existing) return { agentId: existing, duplicate: true };
+		}
+		if (this.tree.live().length >= MAX_LIVE_AGENTS) {
+			throw new Error(`too many live agents (${MAX_LIVE_AGENTS}); wait for one to finish`);
 		}
 
 		this.agentCounter += 1;
@@ -409,10 +419,28 @@ export class SwarmService {
 		return this.store.listAgents().filter((row) => row.spec.parentAgentId === planId).map((row) => row.agentId);
 	}
 
+	/**
+	 * Forget a plan's in-memory child index. A long-lived process accumulates
+	 * one entry per plan forever; the durable child list is recoverable from
+	 * the store, and storeless plans are simply gone.
+	 */
+	forgetPlan(planId: string): void {
+		this.plans.delete(planId);
+	}
+
 	async gatherPlan(planId: string, timeoutMs = 20_000): Promise<PlanGatherResult> {
-		const deadline = Date.now() + timeoutMs;
+		// A non-finite timeout (NaN from a client arg) makes `>= deadline`
+		// never true, so this would poll until the process ends.
+		const budget = Number.isFinite(timeoutMs) ? Math.max(0, Math.trunc(timeoutMs)) : 20_000;
+		const deadline = Date.now() + budget;
 		for (;;) {
-			const children = this.planChildren(planId).map((agentId) => {
+			const childIds = this.planChildren(planId);
+		if (childIds.length === 0) {
+			// No such plan, or its index was already released. Answering
+			// "running" here would poll for the whole window on a typo.
+			return { planId, state: "failed", children: [] };
+		}
+		const children = childIds.map((agentId) => {
 				const agent = this.getAgent(agentId);
 				return {
 					agentId,
@@ -425,7 +453,17 @@ export class SwarmService {
 			if (settled.length === children.length && children.length > 0) {
 				const failed = settled.filter((child) => child.state !== "completed").length;
 				this.events.emit(planId, failed === 0 ? "plan.completed" : "plan.failed", { children: children.length, failed });
+				this.forgetPlan(planId);
 				return { planId, state: failed === 0 ? "completed" : "failed", children };
+			}
+			// An unreapable child (its id is known but the agent is gone —
+			// evicted from the terminal cache, or never recorded) would hold the
+			// plan "running" until the caller's deadline, forever. Report it.
+			const unknown = children.filter((child) => child.state === "unknown");
+			if (unknown.length > 0) {
+				this.events.emit(planId, "plan.failed", { children: children.length, missing: unknown.length });
+				this.forgetPlan(planId);
+				return { planId, state: "failed", children };
 			}
 			if (Date.now() >= deadline) return { planId, state: "running", timedOut: true, children };
 			await new Promise((resolve) => setTimeout(resolve, 500));

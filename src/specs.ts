@@ -4,17 +4,32 @@ import { MAX_PLAN_CHILDREN, type PlanRequest, type PlanSubtask } from "./swarm.t
 
 const TIER_HINTS: ReadonlySet<string> = new Set(["fast", "balanced", "frontier"]);
 const QUALITY_METRICS: ReadonlySet<string> = new Set(["codingIndex", "intelligenceIndex", "agenticIndex"]);
+const CAPABILITIES: ReadonlySet<string> = new Set(["text", "vision", "tools"]);
+
+/**
+ * Coerce to a positive integer, falling back when the value is missing,
+ * non-numeric, or out of range. `Number("abc")` is NaN, which silently
+ * became a zero-turn agent and an instant `max_turns_exceeded`.
+ */
+function positiveInt(value: unknown, fallback: number, max: number): number {
+	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value.trim()) : Number.NaN;
+	if (!Number.isFinite(parsed)) return fallback;
+	return Math.min(max, Math.max(1, Math.trunc(parsed)));
+}
 
 export function parseSpec(input: Record<string, unknown>): Omit<AgentSpec, "agentId"> & { agentId?: string | undefined } {
+	const requested = Array.isArray(input["capabilities"])
+		? input["capabilities"].filter((cap): cap is string => typeof cap === "string" && CAPABILITIES.has(cap))
+		: [];
 	const spec: Omit<AgentSpec, "agentId"> & { agentId?: string | undefined } = {
 		task: String(input["task"] ?? ""),
-		maxTurns: Number(input["maxTurns"] ?? 12),
-		maxWallTimeMs: Number(input["maxWallTimeMs"] ?? 600_000),
-		maxProviderAttemptsPerTurn: Number(input["maxProviderAttemptsPerTurn"] ?? 3),
-		capabilities: Array.isArray(input["capabilities"])
-			? (input["capabilities"].filter((c): c is AgentSpec["capabilities"][number] => typeof c === "string") as AgentSpec["capabilities"])
-			: ["text", "tools"],
-		qualityFloor: typeof input["qualityFloor"] === "number" ? input["qualityFloor"] : null,
+		maxTurns: positiveInt(input["maxTurns"], 12, 200),
+		maxWallTimeMs: positiveInt(input["maxWallTimeMs"], 600_000, 3_600_000),
+		maxProviderAttemptsPerTurn: positiveInt(input["maxProviderAttemptsPerTurn"], 3, 50),
+		capabilities: (requested.length > 0 ? requested : ["text", "tools"]) as AgentSpec["capabilities"],
+		qualityFloor: typeof input["qualityFloor"] === "number" && Number.isFinite(input["qualityFloor"])
+			? Math.min(100, Math.max(0, input["qualityFloor"]))
+			: null,
 		allowUnknownQuality: input["allowUnknownQuality"] === undefined ? true : Boolean(input["allowUnknownQuality"]),
 	};
 	if (typeof input["system"] === "string") spec.system = input["system"];
@@ -25,9 +40,38 @@ export function parseSpec(input: Record<string, unknown>): Omit<AgentSpec, "agen
 	return spec;
 }
 
+/**
+ * Parse plan-level and per-subtask overrides WITHOUT materializing spawn
+ * defaults. Running overrides through `parseSpec` injected its defaults
+ * (maxTurns 12, capabilities ["text","tools"]), which then overrode the
+ * plan's own `defaults` — a documented knob that silently did nothing.
+ */
 function parsePlanOverrides(input: Record<string, unknown>): Omit<PlanSubtask, "task" | "idempotencyKey"> {
-	const spec = parseSpec({ ...input, task: "plan" });
-	const { task: _task, agentId: _agentId, parentAgentId: _parent, ...overrides } = spec as Record<string, unknown>;
+	const overrides: Record<string, unknown> = {};
+	if (typeof input["system"] === "string") overrides["system"] = input["system"];
+	if (input["capabilities"] !== undefined) {
+		const requested = Array.isArray(input["capabilities"])
+			? input["capabilities"].filter((cap): cap is string => typeof cap === "string" && CAPABILITIES.has(cap))
+			: [];
+		if (requested.length > 0) overrides["capabilities"] = requested;
+	}
+	for (const key of ["maxTurns", "maxWallTimeMs", "maxProviderAttemptsPerTurn"] as const) {
+		if (input[key] === undefined) continue;
+		const limits = { maxTurns: [12, 200], maxWallTimeMs: [600_000, 3_600_000], maxProviderAttemptsPerTurn: [3, 50] } as const;
+		const [fallback, max] = limits[key];
+		overrides[key] = positiveInt(input[key], fallback, max);
+	}
+	if (input["qualityFloor"] !== undefined) {
+		const floor = typeof input["qualityFloor"] === "number" ? input["qualityFloor"] : Number.NaN;
+		overrides["qualityFloor"] = Number.isFinite(floor) ? Math.min(100, Math.max(0, floor)) : null;
+	}
+	if (input["allowUnknownQuality"] !== undefined) {
+		overrides["allowUnknownQuality"] = Boolean(input["allowUnknownQuality"]);
+	}
+	if (typeof input["tierHint"] === "string" && TIER_HINTS.has(input["tierHint"])) overrides["tierHint"] = input["tierHint"];
+	if (typeof input["qualityMetric"] === "string" && QUALITY_METRICS.has(input["qualityMetric"])) {
+		overrides["qualityMetric"] = input["qualityMetric"];
+	}
 	return overrides as Omit<PlanSubtask, "task" | "idempotencyKey">;
 }
 

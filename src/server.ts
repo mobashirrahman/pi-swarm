@@ -99,8 +99,8 @@ async function main(): Promise<number> {
 			if (req.method === "GET" && planMatch?.[1]) {
 				const planId = decodeURIComponent(planMatch[1]);
 				const timeoutRaw = url.searchParams.get("timeoutMs");
-				const timeoutMs = timeoutRaw !== null ? Number.parseInt(timeoutRaw, 10) : undefined;
-				sendJson(res, 200, await service.gatherPlan(planId, timeoutMs !== undefined && Number.isFinite(timeoutMs) ? timeoutMs : undefined));
+				const timeoutMs = timeoutRaw !== null ? Number.parseInt(timeoutRaw, 10) : Number.NaN;
+				sendJson(res, 200, await service.gatherPlan(planId, Number.isFinite(timeoutMs) ? timeoutMs : 20_000));
 				return;
 			}
 			const eventsMatch = /^\/v1\/agents\/([^/]+)\/events$/.exec(url.pathname);

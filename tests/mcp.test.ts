@@ -112,6 +112,20 @@ describe("MCP protocol contract", () => {
 		expect(status.state).toBe("completed");
 	});
 
+	it("a non-numeric wait timeout does not hang the request", async () => {
+		const backend = fakeBackend({ status: async () => ({ state: "running", events: [] }) });
+		const at = Date.now();
+		const result = (await handleMessage(
+			backend as never,
+			rpc("tools/call", { name: "swarm_wait", arguments: { agentId: "a1", timeoutMs: "not-a-number" } }),
+		)) as { content: Array<{ text: string }> };
+		const elapsed = Date.now() - at;
+		// NaN fell back to the default window; a NaN deadline never expires.
+		expect(elapsed).toBeGreaterThanOrEqual(19_000);
+		expect(elapsed).toBeLessThan(26_000);
+		expect(JSON.parse(result.content[0]!.text).timedOut).toBe(true);
+	}, 30_000);
+
 	it("swarm_wait reports timedOut when the agent never settles", async () => {
 		const backend = fakeBackend({ status: async () => ({ state: "running", events: [] }) });
 		const result = (await handleMessage(
@@ -121,6 +135,16 @@ describe("MCP protocol contract", () => {
 		const status = JSON.parse(result.content[0]!.text) as { state: string; timedOut: boolean };
 		expect(status.state).toBe("running");
 		expect(status.timedOut).toBe(true);
+	});
+
+	it("clamps out-of-range spec numbers and drops unknown capabilities", async () => {
+		const { parseSpec } = await import("../src/specs.ts");
+		const spec = parseSpec({ task: "t", maxTurns: "abc", maxWallTimeMs: -5, capabilities: ["text", "banana"] });
+		// NaN maxTurns previously produced a zero-turn agent.
+		expect(spec.maxTurns).toBe(12);
+		expect(spec.maxWallTimeMs).toBeGreaterThan(0);
+		expect(spec.capabilities).toEqual(["text"]);
+		expect(parseSpec({ task: "t", maxTurns: 9_999 }).maxTurns).toBe(200);
 	});
 
 	it("tool failures come back in-band with isError, not as a protocol error", async () => {

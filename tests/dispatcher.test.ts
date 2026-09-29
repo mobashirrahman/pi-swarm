@@ -187,6 +187,25 @@ describe("Dispatcher turn execution", () => {
 		expect(dispatcher.circuit.canAdmit("a:9", now)).toBe(true);
 	});
 
+	it("cools a keyed account down when distinct models report an exhausted balance (402)", () => {
+		process.env.PI_SWARM_TEST_BROKE = "test-key";
+		try {
+			registry.register({ ...account("b:1", "broke"), credentialRef: "PI_SWARM_TEST_BROKE" });
+			const dispatcher = new Dispatcher({ accounts: registry, fetchModels: async () => [] });
+			const now = Date.now();
+			// A single 402 is per-model; two distinct models mean the BALANCE
+			// is gone, not that a window is closing.
+			dispatcher.blacklist.recordFailure("b:1/m1", "quota", now);
+			expect(dispatcher.maybeCoolDownExhaustedBalance("b:1", "agent-x")).toBe(false);
+			dispatcher.blacklist.recordFailure("b:1/m2", "quota", now + 1);
+			expect(dispatcher.maybeCoolDownExhaustedBalance("b:1", "agent-x")).toBe(true);
+			expect(dispatcher.circuit.get("b:1").state).toBe("open");
+			expect(dispatcher.circuit.canAdmit("b:1", now + 11 * 60_000)).toBe(true);
+		} finally {
+			delete process.env.PI_SWARM_TEST_BROKE;
+		}
+	});
+
 	it("resetAccount closes the circuit and clears the account's bans", () => {
 		registry.register(account("a:1", "alpha"));
 		const dispatcher = new Dispatcher({ accounts: registry, fetchModels: async () => [] });

@@ -25,7 +25,7 @@ import type { TelemetryStore } from "./telemetry.ts";
 import type { LeaseStore, TurnLease } from "./leases.ts";
 import type { HeaderQuota } from "./quota-headers.ts";
 import { bucketKey, type Candidate, type QualityMetric, type TierHint } from "./types.ts";
-import { CapabilityCache, probeToolsSupport, probeVisionSupport, type VerifiedCapabilities } from "./capabilities.ts";
+import { CapabilityCache, probeToolsSupport, probeVisionSupport, MAX_PROBES_PER_TURN, type VerifiedCapabilities } from "./capabilities.ts";
 
 const _logger = createLogger("dispatcher");
 
@@ -104,6 +104,9 @@ const TURN_WAIT_BUDGET_MS = 240_000;
  */
 const CREDENTIAL_COOLDOWN_MS = 10 * 60_000;
 
+/** A probe is a real request; reserve for it like a (tiny) turn. */
+const PROBE_ESTIMATED_TOKENS = 512;
+
 export class Dispatcher {
 	readonly quota: QuotaRegistry;
 	readonly blacklist: Blacklist;
@@ -117,6 +120,7 @@ export class Dispatcher {
 	private readonly quotaBackoffBaseMs: number;
 	private readonly telemetry: TelemetryStore | undefined;
 	private readonly capabilities: CapabilityCache;
+	private readonly probeInFlight = new Map<string, Promise<boolean | null>>();
 	/** "accountId/modelId" → health. */
 	private readonly health = new Map<string, ModelHealth>();
 	/** providerId → accounts. */
@@ -311,50 +315,132 @@ export class Dispatcher {
 	 * spending the turn on it. Returns true when the model proved
 	 * UNSUPPORTED (caller excludes it and reselects without consuming an
 	 * attempt). Inconclusive probes keep the assumed capabilities and send.
+	 *
+	 * Probes are a real provider request, so they are BUDGETED (per turn),
+	 * ACCOUNTED (same quota reservation + lease as a turn), and
+	 * SINGLE-FLIGHTED (concurrent agents share one verdict).
 	 */
 	private async verifyCapabilities(
 		account: AccountRegistryEntry,
 		candidate: Candidate,
 		requirements: TurnRequirements,
 		signal: AbortSignal,
+		probeBudget: { remaining: number },
 	): Promise<boolean> {
 		const needTools = requirements.capabilities.includes("tools") && candidate.capsProbed?.tools !== true;
 		const needVision = requirements.capabilities.includes("vision") && candidate.capsProbed?.vision !== true;
 		if (!needTools && !needVision) return false;
+		if (probeBudget.remaining <= 0) return false;
 		const endpoint = { baseUrl: account.baseUrl, modelId: candidate.modelId, apiKey: resolveKey(account), signal };
 		const verified: VerifiedCapabilities = {};
 		if (needTools) {
-			const tools = await probeToolsSupport(endpoint);
+			const tools = await this.probe(
+				`${candidate.accountId}/${candidate.modelId}/tools`,
+				probeBudget,
+				() => probeToolsSupport(endpoint),
+				account,
+				candidate,
+			);
 			if (tools === false) {
-				this.capabilities.set(account.accountId, candidate.modelId, { tools: false });
-				candidate.capsProbed = { tools: true, vision: candidate.capsProbed?.vision ?? false };
-				candidate.capabilities.tools = false;
+				this.recordCapability(candidate, { tools: false });
 				_logger.info("tool_probe_unsupported", { account: account.accountId, model: candidate.modelId });
 				return true;
 			}
 			if (tools === true) verified.tools = true;
 		}
 		if (needVision) {
-			const vision = await probeVisionSupport(endpoint);
+			const vision = await this.probe(
+				`${candidate.accountId}/${candidate.modelId}/vision`,
+				probeBudget,
+				() => probeVisionSupport(endpoint),
+				account,
+				candidate,
+			);
 			if (vision === false) {
-				this.capabilities.set(account.accountId, candidate.modelId, { vision: false });
-				candidate.capsProbed = { tools: candidate.capsProbed?.tools ?? false, vision: true };
-				candidate.capabilities.vision = false;
+				this.recordCapability(candidate, { vision: false });
 				_logger.info("vision_probe_unsupported", { account: account.accountId, model: candidate.modelId });
 				return true;
 			}
 			if (vision === true) verified.vision = true;
 		}
 		if (verified.tools !== undefined || verified.vision !== undefined) {
-			this.capabilities.set(account.accountId, candidate.modelId, verified);
-			candidate.capsProbed = {
-				tools: candidate.capsProbed?.tools ?? verified.tools !== undefined,
-				vision: candidate.capsProbed?.vision ?? verified.vision !== undefined,
-			};
-			if (verified.tools !== undefined) candidate.capabilities.tools = true;
-			if (verified.vision !== undefined) candidate.capabilities.vision = true;
+			this.recordCapability(candidate, verified);
 		}
 		return false;
+	}
+
+	/**
+	 * Run one capability probe under the account's normal capacity gate, with
+	 * single-flight sharing. `null` means "could not probe" (no capacity, or
+	 * budget spent) and must leave capabilities assumed.
+	 */
+	private async probe(
+		key: string,
+		probeBudget: { remaining: number },
+		run: () => Promise<boolean | null>,
+		account: AccountRegistryEntry,
+		candidate: Candidate,
+	): Promise<boolean | null> {
+		const inFlight = this.probeInFlight.get(key);
+		if (inFlight) return inFlight;
+		if (probeBudget.remaining <= 0) return null;
+		probeBudget.remaining -= 1;
+		const promise = this.withProbedSlot(account, candidate, run)
+			.then((verdict) => verdict ?? null)
+			.catch(() => null)
+			.finally(() => {
+				this.probeInFlight.delete(key);
+			});
+		this.probeInFlight.set(key, promise);
+		return promise;
+	}
+
+	/**
+	 * Probe inside a real quota reservation and cross-process lease, so
+	 * verification can never exceed the account's budget or its concurrency
+	 * cap. Returns undefined when the account has no capacity right now.
+	 */
+	private async withProbedSlot<T>(
+		account: AccountRegistryEntry,
+		candidate: Candidate,
+		run: () => Promise<T>,
+	): Promise<T | undefined> {
+		const reservation = this.quota.tryReserve(
+			{ accountId: account.accountId, modelId: candidate.modelId, estimatedTokens: PROBE_ESTIMATED_TOKENS },
+			Date.now(),
+			account.maxConcurrency || this.defaultMaxConcurrency,
+		);
+		if (!reservation.ok || !reservation.reservation) return undefined;
+		this.quota.markSent(reservation.reservation.id);
+		const lease = this.leases?.acquire({
+			accountId: account.accountId,
+			agentId: "capability-probe",
+			turnIndex: 0,
+			maxConcurrency: account.maxConcurrency || this.defaultMaxConcurrency,
+			ttlMs: this.leaseTtlMs,
+		}) ?? null;
+		if (this.leases && lease === null) {
+			this.quota.release(reservation.reservation.id);
+			return undefined;
+		}
+		try {
+			return await run();
+		} finally {
+			this.quota.commit(reservation.reservation.id, 0);
+			this.releaseLease(lease);
+		}
+	}
+
+	private recordCapability(candidate: Candidate, verified: VerifiedCapabilities): void {
+		this.capabilities.set(candidate.accountId, candidate.modelId, verified);
+		if (verified.tools !== undefined) {
+			candidate.capabilities.tools = verified.tools;
+			candidate.capsProbed = { tools: true, vision: candidate.capsProbed?.vision ?? false };
+		}
+		if (verified.vision !== undefined) {
+			candidate.capabilities.vision = verified.vision;
+			candidate.capsProbed = { tools: candidate.capsProbed?.tools ?? false, vision: true };
+		}
 	}
 
 	private isProbationBlock(accountId: string, blockKey: string): boolean {
@@ -462,6 +548,8 @@ export class Dispatcher {
 		 */
 		let quotaWaits = 0;
 		const MAX_QUOTA_WAITS = 20;
+		/** Capability probes this turn may still issue (never from the attempt budget). */
+		const probeBudget = { remaining: MAX_PROBES_PER_TURN };
 		let lastFailedRoute: { accountId: string; modelId: string; reason: string } | undefined;
 		while (attempt <= opts.maxAttempts + quotaWaits && quotaWaits <= MAX_QUOTA_WAITS) {
 			if (opts.signal.aborted) return { ok: false, reason: "aborted" };
@@ -513,7 +601,7 @@ export class Dispatcher {
 			const account = this.accounts.get(candidate.accountId);
 			if (!account) return { ok: false, reason: "account_missing" };
 
-			if (await this.verifyCapabilities(account, candidate, requirements, opts.signal)) {
+			if (await this.verifyCapabilities(account, candidate, requirements, opts.signal, probeBudget)) {
 				excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
 				continue;
 			}
@@ -699,6 +787,13 @@ export class Dispatcher {
 				// 1s-base jitter just burns attempts against a closed window.
 				const quotaClass = cls === "quota";
 				if (quotaClass) quotaWaits += 1; // a wait, not a failed attempt
+				// 402 is billing, not rate limiting: an exhausted balance will
+				// not refill on a cooldown, and every model on the account
+				// fails the same way. Treat distinct-model 402s as an account
+				// signal so a depleted key stops burning attempts.
+				if (outcome.status === 402 && this.maybeCoolDownExhaustedBalance(candidate.accountId, opts.agentId)) {
+					excludeAccounts.add(candidate.accountId);
+				}
 				const waitMs = outcome.quota.retryAfterMs
 					?? computeRetryBackoffMs(attempt - 1, quotaClass ? this.quotaBackoffBaseMs : 1_000, { capMs: quotaClass ? 15_000 : 10_000 });
 				if (opts.signal.aborted) return { ok: false, reason: "aborted" };
@@ -828,6 +923,30 @@ export class Dispatcher {
 			return true;
 		}
 		return false;
+	}
+
+	/**
+	 * Distinct models on one account answering 402 means the BALANCE is gone,
+	 * not that a window is closing. Without this, one depleted key consumed
+	 * the whole attempt budget model by model (measured live: cline at $0.00
+	 * failed 6 attempts across 6 models before the turn gave up).
+	 */
+	maybeCoolDownExhaustedBalance(accountId: string, agentId: string): boolean {
+		const distinct = new Set<string>();
+		for (const [key, entry] of this.blacklist.snapshot()) {
+			if (!key.startsWith(`${accountId}/`)) continue;
+			if (entry.reasons.includes("quota")) distinct.add(key);
+		}
+		if (distinct.size < 2) return false;
+		const now = Date.now();
+		this.circuit.openUntil(accountId, now + CREDENTIAL_COOLDOWN_MS, now);
+		_logger.info("account_disabled_exhausted_balance", {
+			agentId,
+			account: accountId,
+			distinctModels: distinct.size,
+			cooldownMs: CREDENTIAL_COOLDOWN_MS,
+		});
+		return true;
 	}
 
 	private applyQuotaObservation(

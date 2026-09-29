@@ -39,6 +39,20 @@ const PROTOCOL_VERSION = "2024-11-05";
  */
 const DEFAULT_WAIT_TIMEOUT_MS = 20_000;
 const WAIT_POLL_MS = 500;
+/** Ceiling on a client-supplied wait: keeps one call from pinning a slot. */
+const MAX_WAIT_TIMEOUT_MS = 600_000;
+
+/**
+ * Parse a wait/gather timeout from untrusted args. A non-numeric value used
+ * to produce a NaN deadline, whose `Date.now() >= deadline` test is never
+ * true — the poll loop then never returned and the MCP request hung until
+ * the client gave up.
+ */
+export function parseTimeoutMs(value: unknown, fallback: number = DEFAULT_WAIT_TIMEOUT_MS): number {
+	const parsed = typeof value === "number" ? value : typeof value === "string" ? Number(value.trim()) : Number.NaN;
+	if (!Number.isFinite(parsed)) return fallback;
+	return Math.min(MAX_WAIT_TIMEOUT_MS, Math.max(0, Math.trunc(parsed)));
+}
 
 interface JsonRpcRequest {
 	jsonrpc: "2.0";
@@ -233,7 +247,7 @@ const TOOLS: ToolDefinition[] = [
 interface SwarmBackend {
 	spawn(args: Record<string, unknown>): Promise<{ agentId: string; duplicate: boolean }>;
 	plan(args: Record<string, unknown>): Promise<{ planId: string; childIds: string[]; duplicate: boolean }>;
-	gather(planId: string, timeoutMs: number | undefined): Promise<unknown>;
+	gather(planId: string, timeoutMs: number): Promise<unknown>;
 	status(agentId: string): Promise<{ state: string; finalContent?: string | undefined; failReason?: string | undefined; events: string[] }>;
 	cancel(agentId: string): Promise<boolean>;
 	capacity(): Promise<unknown>;
@@ -256,7 +270,7 @@ class EmbeddedBackend implements SwarmBackend {
 		return this.service.spawnPlan(parsePlanRequest(args));
 	}
 
-	async gather(planId: string, timeoutMs: number | undefined): Promise<unknown> {
+	async gather(planId: string, timeoutMs: number): Promise<unknown> {
 		return this.service.gatherPlan(planId, timeoutMs);
 	}
 
@@ -331,9 +345,8 @@ class HttpBackend implements SwarmBackend {
 		return (await response.json()) as { planId: string; childIds: string[]; duplicate: boolean };
 	}
 
-	async gather(planId: string, timeoutMs: number | undefined): Promise<unknown> {
-		const query = timeoutMs !== undefined ? `?timeoutMs=${Number(timeoutMs)}` : "";
-		const response = await fetch(`${this.baseUrl}/v1/plans/${encodeURIComponent(planId)}${query}`);
+	async gather(planId: string, timeoutMs: number): Promise<unknown> {
+		const response = await fetch(`${this.baseUrl}/v1/plans/${encodeURIComponent(planId)}?timeoutMs=${timeoutMs}`);
 		if (!response.ok) throw new Error(`gather failed: ${response.status}`);
 		return await response.json();
 	}
@@ -419,8 +432,7 @@ async function callTool(backend: SwarmBackend, name: string, args: Record<string
 		}
 		case "swarm_gather": {
 			const planId = String(args["planId"] ?? "");
-			const timeoutMs = args["timeoutMs"] !== undefined ? Number(args["timeoutMs"]) : undefined;
-			return JSON.stringify(await backend.gather(planId, timeoutMs));
+			return JSON.stringify(await backend.gather(planId, parseTimeoutMs(args["timeoutMs"], DEFAULT_WAIT_TIMEOUT_MS)));
 		}
 		case "swarm_status": {
 			const status = await backend.status(String(args["agentId"] ?? ""));
@@ -428,7 +440,7 @@ async function callTool(backend: SwarmBackend, name: string, args: Record<string
 		}
 		case "swarm_wait": {
 			const agentId = String(args["agentId"] ?? "");
-			const timeoutMs = Number(args["timeoutMs"] ?? DEFAULT_WAIT_TIMEOUT_MS);
+			const timeoutMs = parseTimeoutMs(args["timeoutMs"], DEFAULT_WAIT_TIMEOUT_MS);
 			const deadline = Date.now() + timeoutMs;
 			for (;;) {
 				const status = await backend.status(agentId);
