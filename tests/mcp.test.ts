@@ -48,7 +48,7 @@ describe("MCP protocol contract", () => {
 		expect(result.protocolVersion).toBe("2024-11-05");
 		expect(result.capabilities.tools).toBeDefined();
 		expect(result.serverInfo.name).toBe("pi-swarm");
-		expect(result.serverInfo.version).toBe("1.1.3");
+		expect(result.serverInfo.version).toBe("1.2.0");
 	});
 
 	it("notifications produce no response", async () => {

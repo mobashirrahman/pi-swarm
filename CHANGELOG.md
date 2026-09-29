@@ -2,6 +2,28 @@
 
 All notable changes to pi-swarm are documented here.
 
+## [1.2.0] - 2026-09-29
+
+Pool health reporting and a wider usable pool.
+
+- **`swarm_doctor`**: diagnoses every configured account with one tiny real
+  chat request and reports `ok`, `balance_exhausted`, `chat_failed`,
+  `catalog_unreachable`, `unreachable`, `no_routable_models`, or
+  `no_credential`. Catalog reachability is not health — Cline lists 460
+  models and answers chat with `insufficient_credits`, and Gemini lists 61
+  model ids and 404s every one — so the probe must be a real turn. Only
+  models the swarm would actually route to are probed, the sweep is bounded
+  by one deadline, provider error text is redacted, and routing is never
+  changed by a verdict. Also at `GET /v1/doctor`.
+- **Free entitlements outrank catalog prices**: some free tiers meter usage
+  instead of pricing it at zero (Groq answers 200 on a free key while
+  `/models` lists real prices), so an explicit `freeEntitlement` now admits
+  a priced model. Seeds carry entitlements.
+- **Groq added**, verified live: four free models, all answering 200.
+- **llm7 no longer seeded anonymously**: its catalog is paid-only and its
+  flagship answers `model_unavailable`, so keyless seeding spent an hourly
+  catalog fetch on an empty pool.
+
 ## [1.1.3] - 2026-09-29
 
 Correctness and quota-safety fixes found by a repository bug review.

@@ -133,7 +133,7 @@ or Codex lists `swarm` with 9 tools), then ask it to:
 
 ## Status
 
-**All phases of the plan are implemented and verified.** 213 tests green.
+**All phases of the plan are implemented and verified.** 219 tests green.
 
 | Phase | Scope | State |
 | --- | --- | --- |
@@ -190,6 +190,21 @@ account.
 Intelligence scores and provider catalogs re-fetch on an hourly loop
 (`PI_SWARM_REFRESH_MS` overrides), in both the HTTP server and the embedded
 MCP backend — long-lived swarms track new free models without restarts.
+
+### Pool health (`swarm_doctor`)
+
+The pool rots silently, so the swarm can diagnose itself. `swarm_doctor` sends
+one tiny real chat request per configured account and reports each as `ok`,
+`balance_exhausted`, `chat_failed`, `catalog_unreachable`, `unreachable`,
+`no_routable_models`, or `no_credential`.
+
+Catalog reachability alone is not health — verified live: Cline lists 460
+models and answers chat with `insufficient_credits`, and Gemini's
+OpenAI-compat endpoint lists 61 model ids and 404s every one. The doctor
+therefore probes a model the swarm would actually route to, spends no
+request on a paid-only catalog, bounds the sweep by one deadline, and
+redacts opaque strings from provider error text. It is diagnostic only, so
+routing is never changed by a verdict.
 
 ### Capability discovery
 
@@ -403,8 +418,10 @@ curl localhost:7463/v1/capacity
 curl -N localhost:7463/v1/agents/<id>/events        # SSE; ?since=<seq> resumes
 # after a credential rotation or a false-positive trip (no restart needed):
 curl -X POST localhost:7463/v1/capacity/reset -H 'Content-Type: application/json' \
-  -d '{"accountId":"llm7:primary"}'
+  -d '{"accountId":"openrouter:primary"}'
 # MCP equivalent: swarm_reset (omit accountId to reset all)
+# which providers can actually serve a turn?
+curl "localhost:7463/v1/doctor?timeoutMs=45000"   # MCP equivalent: swarm_doctor
 ```
 
 Scores and catalogs re-fetch in the background every hour
