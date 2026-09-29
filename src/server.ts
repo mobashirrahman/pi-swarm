@@ -169,6 +169,13 @@ async function main(): Promise<number> {
 				sendJson(res, 200, service.resetCapacity(accountId));
 				return;
 			}
+			if (req.method === "GET" && url.pathname === "/v1/doctor") {
+				// Diagnostic sweep; sends one tiny request per account.
+				const timeoutRaw = url.searchParams.get("timeoutMs");
+				const timeoutMs = timeoutRaw !== null ? Number.parseInt(timeoutRaw, 10) : Number.NaN;
+				sendJson(res, 200, await service.doctor({ timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : undefined }));
+				return;
+			}
 			if (req.method === "GET" && url.pathname === "/v1/models") {
 				// The routing view: what decides which backend serves a turn.
 				const limitRaw = url.searchParams.get("limit");

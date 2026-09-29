@@ -14,6 +14,7 @@ interface FakeBackend {
 	status(agentId: string): Promise<{ state: string; finalContent?: string | undefined; failReason?: string | undefined; events: string[] }>;
 	cancel(agentId: string): Promise<boolean>;
 	capacity(): Promise<unknown>;
+	doctor(args: Record<string, unknown>): Promise<unknown>;
 	models(args: Record<string, unknown>): Promise<unknown>;
 	reset(args: Record<string, unknown>): Promise<unknown>;
 }
@@ -26,6 +27,7 @@ function fakeBackend(overrides: Partial<FakeBackend> = {}): FakeBackend {
 		status: async () => ({ state: "completed", finalContent: "42", events: ["agent.queued", "agent.completed"] }),
 		cancel: async () => true,
 		capacity: async () => [{ accountId: "fake:primary", circuit: "closed" }],
+		doctor: async () => ({ usable: 1, total: 1, reports: [{ accountId: "fake:primary", verdict: "ok", usable: true }] }),
 		models: async () => [{ accountId: "fake:primary", modelId: "m1", quality: 71.5, tokensPerSecond: 40 }],
 		reset: async () => ({ reset: ["fake:primary"], clearedBans: 0 }),
 		...overrides,
@@ -62,7 +64,7 @@ describe("MCP protocol contract", () => {
 			tools: Array<{ name: string; description: string; inputSchema: { type: string; required?: string[] } }>;
 		};
 		const names = result.tools.map((tool) => tool.name);
-		expect(names).toEqual(["swarm_spawn", "swarm_wait", "swarm_status", "swarm_cancel", "swarm_plan", "swarm_gather", "swarm_capacity", "swarm_models", "swarm_reset"]);
+		expect(names).toEqual(["swarm_spawn", "swarm_wait", "swarm_status", "swarm_cancel", "swarm_plan", "swarm_gather", "swarm_doctor", "swarm_capacity", "swarm_models", "swarm_reset"]);
 		for (const tool of result.tools) {
 			expect(tool.description.length).toBeGreaterThan(10);
 			expect(tool.inputSchema.type).toBe("object");

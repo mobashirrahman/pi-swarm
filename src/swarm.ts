@@ -12,6 +12,7 @@
 import { AgentRuntime, type AgentSpec, type AgentState } from "./agent.ts";
 import { AccountRegistry, resolveKey, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
 import { CapabilityCache } from "./capabilities.ts";
+import { doctor, type DoctorSweep } from "./doctor.ts";
 import { availableSeeds } from "./providers.ts";
 import { candidateQuality } from "./selector.ts";
 import { createLogger } from "./logger.ts";
@@ -507,6 +508,25 @@ export class SwarmService {
 				models: candidates.get(account.accountId) ?? 0,
 			};
 		});
+	}
+
+	/**
+	 * Diagnose every configured account against its live provider and report
+	 * which ones can actually serve a turn. Diagnostic only — routing is
+	 * unchanged, so a false negative costs nothing but a probe.
+	 */
+	async doctor(options: { timeoutMs?: number | undefined } = {}): Promise<{
+		reports: Array<DoctorSweep & { routableModels: number; catalogModels: number }>;
+		usable: number;
+		total: number;
+	}> {
+		const routable = new Map<string, string[]>();
+		for (const candidate of this.dispatcher.candidates()) {
+			const list = routable.get(candidate.accountId) ?? [];
+			list.push(candidate.modelId);
+			routable.set(candidate.accountId, list);
+		}
+		return doctor(this.accounts.all(), routable, { timeoutMs: options.timeoutMs });
 	}
 
 	/** Re-resolve refresh interval from the environment (ms). */

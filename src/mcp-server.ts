@@ -211,6 +211,17 @@ const TOOLS: ToolDefinition[] = [
 		},
 	},
 	{
+		name: "swarm_doctor",
+		description:
+			"Diagnose every configured provider: which accounts can actually serve a turn, which are dead, and which are out of credit. Sends one tiny request per account (a few seconds). Use this when turns fail or before adding keys; it does not change routing.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				timeoutMs: { type: "number", description: "Budget for the whole sweep (default 60000)." },
+			},
+		},
+	},
+	{
 		name: "swarm_capacity",
 		description: "Show per-account provider capacity: circuit state, in-flight turns, and remaining quota where known.",
 		inputSchema: { type: "object", properties: {} },
@@ -251,6 +262,7 @@ interface SwarmBackend {
 	status(agentId: string): Promise<{ state: string; finalContent?: string | undefined; failReason?: string | undefined; events: string[] }>;
 	cancel(agentId: string): Promise<boolean>;
 	capacity(): Promise<unknown>;
+	doctor(args: Record<string, unknown>): Promise<unknown>;
 	models(args: Record<string, unknown>): Promise<unknown>;
 	reset(args: Record<string, unknown>): Promise<unknown>;
 }
@@ -291,6 +303,11 @@ class EmbeddedBackend implements SwarmBackend {
 
 	async capacity(): Promise<unknown> {
 		return this.service.capacity();
+	}
+
+	async doctor(args: Record<string, unknown>): Promise<unknown> {
+		const timeoutMs = parseTimeoutMs(args["timeoutMs"], 60_000);
+		return this.service.doctor({ timeoutMs });
 	}
 
 	async models(args: Record<string, unknown>): Promise<unknown> {
@@ -366,6 +383,15 @@ class HttpBackend implements SwarmBackend {
 
 	async capacity(): Promise<unknown> {
 		const response = await fetch(`${this.baseUrl}/v1/capacity`);
+		return await response.json();
+	}
+
+	async doctor(args: Record<string, unknown>): Promise<unknown> {
+		const params = new URLSearchParams();
+		if (args["timeoutMs"] !== undefined) params.set("timeoutMs", String(Number(args["timeoutMs"])));
+		const query = params.size > 0 ? `?${params.toString()}` : "";
+		const response = await fetch(`${this.baseUrl}/v1/doctor${query}`);
+		if (!response.ok) throw new Error(`doctor failed: ${response.status}`);
 		return await response.json();
 	}
 
@@ -457,6 +483,9 @@ async function callTool(backend: SwarmBackend, name: string, args: Record<string
 		}
 		case "swarm_capacity": {
 			return JSON.stringify(await backend.capacity());
+		}
+		case "swarm_doctor": {
+			return JSON.stringify(await backend.doctor(args));
 		}
 		case "swarm_models": {
 			return JSON.stringify(await backend.models(args));
