@@ -2,6 +2,24 @@
 
 All notable changes to pi-swarm are documented here.
 
+## [1.3.0] - 2026-09-29
+
+Measure what the swarm actually delivers, and make its agents discoverable.
+
+- **Reliability benchmark** (`scripts/bench-reliability.ts`): the only
+  measurement that answers whether the product works. Every task carries a
+  judge, so a plausible-but-wrong answer fails instead of passing on
+  plausibility and an empty answer fails too. Reports pass rate,
+  time-to-completion percentiles, throughput at the chosen concurrency,
+  per-account and per-model attribution, reroute count, and failure reasons.
+  Attribution reads each agent's own `model.changed` events, so the runtime
+  needs no extra bookkeeping. The first live run on a real key file scored
+  0.5 pass rate with 1 of 16 accounts serving any turn — the measurement the
+  earlier harnesses could not produce.
+- **`swarm_agents`**: lists live agents first, then recently finished, each
+  with the task's first line and answer size. Filter by `parentAgentId` to
+  see one plan's subtasks. Also available as `GET /v1/agents`.
+
 ## [1.2.0] - 2026-09-29
 
 Pool health reporting and a wider usable pool.

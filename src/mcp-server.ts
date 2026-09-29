@@ -27,7 +27,7 @@ import { pathToFileURL } from "node:url";
 import { parsePlanRequest, parseSpec } from "./specs.ts";
 
 const SERVER_NAME = "pi-swarm";
-const SERVER_VERSION = "1.2.0";
+const SERVER_VERSION = "1.3.0";
 const PROTOCOL_VERSION = "2024-11-05";
 /**
  * Default `swarm_wait` budget. MUST stay under the MCP client's request

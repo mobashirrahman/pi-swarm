@@ -14,6 +14,7 @@ native tools.
 | `swarm_cancel` | Cancel an agent and every agent it spawned |
 | `swarm_plan` | Fan out 1–10 subtasks as concurrent child agents; returns a plan id |
 | `swarm_gather` | Block until the plan's children finish; returns every answer |
+| `swarm_agents` | List live and recent agents; filter by plan id |
 | `swarm_doctor` | Diagnose every provider: usable, dead, or out of credit |
 | `swarm_capacity` | Per-account circuit state, in-flight turns, remaining quota |
 | `swarm_models` | Routing view: which model serves next, and why |

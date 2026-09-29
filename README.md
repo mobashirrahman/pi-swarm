@@ -133,7 +133,7 @@ or Codex lists `swarm` with 9 tools), then ask it to:
 
 ## Status
 
-**All phases of the plan are implemented and verified.** 219 tests green.
+**All phases of the plan are implemented and verified.** 231 tests green.
 
 | Phase | Scope | State |
 | --- | --- | --- |
@@ -190,6 +190,33 @@ account.
 Intelligence scores and provider catalogs re-fetch on an hourly loop
 (`PI_SWARM_REFRESH_MS` overrides), in both the HTTP server and the embedded
 MCP backend — long-lived swarms track new free models without restarts.
+
+### Reliability measurement
+
+The scheduler harness measures turns per second against a fake provider. The
+reliability harness measures the only question that decides whether the
+product works: **of the tasks you hand the swarm, how many come back
+correct, how fast, and which backend served them.**
+
+```bash
+npx tsx scripts/bench-reliability.ts --tasks 12 --concurrency 4
+```
+
+Every task ships with a judge, so a plausible-but-wrong answer fails rather
+than passing on plausibility, and an empty final answer is a failure too.
+The report gives pass rate, time-to-completion percentiles, throughput at the
+chosen concurrency, per-account and per-model attribution, reroute count, and
+failure reasons — so the remaining failures can be located instead of
+guessed at. Attribution comes from each agent's own events, so the harness
+adds no bookkeeping to the runtime.
+
+### Agent discovery (`swarm_agents`)
+
+`swarm_agents` lists what is running so a caller can find agents it spawned
+without tracking ids. Live agents come first, then recently finished, each
+with the task's first line and (once finished) the answer size, so an empty
+result is visible. Pass `parentAgentId` to see one plan's subtasks, and
+`state: "all"` to include finished agents.
 
 ### Pool health (`swarm_doctor`)
 
@@ -422,6 +449,8 @@ curl -X POST localhost:7463/v1/capacity/reset -H 'Content-Type: application/json
 # MCP equivalent: swarm_reset (omit accountId to reset all)
 # which providers can actually serve a turn?
 curl "localhost:7463/v1/doctor?timeoutMs=45000"   # MCP equivalent: swarm_doctor
+# what's running right now? (also GET /v1/agents/<id>)
+curl "localhost:7463/v1/agents"                  # MCP equivalent: swarm_agents
 ```
 
 Scores and catalogs re-fetch in the background every hour
