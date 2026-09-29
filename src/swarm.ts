@@ -247,17 +247,30 @@ export class SwarmService {
 					// two tool calls). A text-only agent should just answer.
 					const tools = spec.capabilities.includes("tools") ? this.toolExecutor?.specs() : undefined;
 					const result = await this.dispatcher.executeTurn(messages, opts, tools);
-					if (this.store && result.ok) {
-						this.store.recordAttempt({
-							attemptId: `${opts.agentId}:${opts.turnIndex}:${result.accountId}`,
-							agentId: opts.agentId,
-							turnIndex: opts.turnIndex,
-							accountId: result.accountId,
-							modelId: result.modelId,
-							sentAt: now,
-							status: "committed",
+					if (result.ok) {
+						// Which backend actually served the turn. Metadata only —
+						// no prompt, no arguments, no body.
+						this.events.emit(spec.agentId, "model.changed", {
+							turn: opts.turnIndex,
+							account: result.accountId,
+							model: result.modelId,
 							latencyMs: result.outcome.latencyMs,
+							...(result.reroutedFrom
+								? { reroutedFrom: `${result.reroutedFrom.accountId}/${result.reroutedFrom.modelId}`, rerouteReason: result.reroutedFrom.reason }
+								: {}),
 						});
+						if (this.store) {
+							this.store.recordAttempt({
+								attemptId: `${opts.agentId}:${opts.turnIndex}:${result.accountId}`,
+								agentId: opts.agentId,
+								turnIndex: opts.turnIndex,
+								accountId: result.accountId,
+								modelId: result.modelId,
+								sentAt: now,
+								status: "committed",
+								latencyMs: result.outcome.latencyMs,
+							});
+						}
 					}
 					if (!result.ok) {
 						// Aborts are cancellation, not failure: the runtime
