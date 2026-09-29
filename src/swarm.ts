@@ -161,6 +161,7 @@ export class SwarmService {
 					baseUrl: seed.baseUrl,
 					anonymousTier: seed.anonymousTier,
 					category: seed.category,
+					...(seed.freeEntitlement !== undefined ? { freeEntitlement: seed.freeEntitlement } : {}),
 				});
 			}
 		}

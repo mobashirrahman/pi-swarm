@@ -78,6 +78,24 @@ describe("strict free-only candidate filtering", () => {
 		}
 	});
 
+	it("an explicit entitlement admits a PRICED model (metered free tier)", async () => {
+		process.env.PI_SWARM_TEST_METERED = "test-key";
+		try {
+			const dispatcher = new Dispatcher({
+				accounts: registry([account({ accountId: "metered:1", category: "free", credentialRef: "PI_SWARM_TEST_METERED", freeEntitlement: { models: ["metered-model"] } })]),
+				fetchModels: async () => [
+					{ id: "metered-model", pricing: { prompt: "0.00000015", completion: "0.0000006" }, context_length: 128_000 },
+					{ id: "other-paid", pricing: { prompt: "3", completion: "15" }, context_length: 128_000 },
+				],
+			});
+			const candidates = await dispatcher.loadCandidates();
+			expect(candidates.map((c) => c.modelId)).toEqual(["metered-model"]);
+			expect(candidates[0]?.freeBasis).toBe("entitlement");
+		} finally {
+			delete process.env.PI_SWARM_TEST_METERED;
+		}
+	});
+
 	it("still fails closed for a keyed paid provider with an unpriced catalog", async () => {
 		process.env.PI_SWARM_TEST_PAID_KEY = "test-key";
 		try {
@@ -111,6 +129,7 @@ describe("strict free-only candidate filtering", () => {
 			fetchModels: async () => models,
 		});
 		const candidates = await dispatcher.loadCandidates();
+		// `priced` is zero-pricing-exempt: the entitlement names `unpriced` only.
 		expect(candidates.map((c) => c.modelId)).toEqual(["zero-priced", "unpriced"]);
 		expect(candidates[1]?.freeBasis).toBe("entitlement");
 	});
@@ -127,12 +146,13 @@ describe("strict free-only candidate filtering", () => {
 		expect(candidates.map((c) => c.modelId)).toEqual(["tiered"]);
 	});
 
-	it("dropping the entitlement drops the unpriced model again", async () => {
+	it("allModels admits the whole catalog, priced models included", async () => {
 		const dispatcher = new Dispatcher({
 			accounts: registry([account({ accountId: "freemium:1", category: "freemium", freeEntitlement: { allModels: true } })]),
 			fetchModels: async () => models,
 		});
 		const entitled = await dispatcher.loadCandidates();
-		expect(entitled.map((c) => c.modelId)).toEqual(["zero-priced", "unpriced"]);
+		expect(entitled.map((c) => c.modelId)).toEqual(["zero-priced", "priced", "unpriced"]);
+		expect(entitled.every((c) => c.freeBasis === "entitlement")).toBe(true);
 	});
 });

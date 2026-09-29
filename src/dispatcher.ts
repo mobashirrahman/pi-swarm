@@ -180,16 +180,24 @@ export class Dispatcher {
 			const usable = anonymous && anonymousTier !== undefined
 				? chatModels.filter((model) => model.tier === undefined || model.tier === anonymousTier)
 				: chatModels;
-			const isFree = (model: WireModel): boolean => {
-				if (model.pricing !== undefined) return wireModelIsFree(model);
-				if (account.category === "free") return true;
-				if (account.category === "paid") return false;
-				if (resolveKey(account) !== undefined) return true;
+			const entitled = (model: WireModel): boolean => {
 				const entitlement = account.freeEntitlement;
 				if (!entitlement) return false;
 				if (entitlement.allModels) return true;
 				if (entitlement.tiers?.includes(model.tier ?? "")) return true;
 				return entitlement.models?.includes(model.id) ?? false;
+			};
+			const isFree = (model: WireModel): boolean => {
+				// An explicit entitlement outranks the catalog price: some free
+				// tiers meter usage instead of pricing it at zero (verified live
+				// on Groq), so a declared entitlement is the only way those
+				// models become routable without weakening the free-only policy.
+				if (entitled(model)) return true;
+				if (model.pricing !== undefined) return wireModelIsFree(model);
+				if (account.category === "free") return true;
+				if (account.category === "paid") return false;
+				if (resolveKey(account) !== undefined) return true;
+				return false;
 			};
 			const visible = usable.filter(isFree);
 			for (const model of visible) {
@@ -203,7 +211,7 @@ export class Dispatcher {
 					name: model.name ?? model.id,
 					ciScore: quality ?? null,
 					qualityScores: score ? { ...score } : undefined,
-					freeBasis: model.pricing !== undefined ? "catalog" : account.category === "free" ? "provider_category" : "entitlement",
+					freeBasis: entitled(model) ? "entitlement" : model.pricing !== undefined ? "catalog" : account.category === "free" ? "provider_category" : "entitlement",
 					capabilities: {
 						text: true,
 						vision: verified?.vision ?? false,

@@ -10,6 +10,8 @@
  * chat anonymously on its "turbo" tier.
  */
 
+import type { FreeEntitlement } from "./types.ts";
+
 export interface ProviderSeed {
 	providerId: string;
 	baseUrl: string;
@@ -26,6 +28,14 @@ export interface ProviderSeed {
 	anonymousTier?: string | undefined;
 	/** Provider category, for audits and docs. */
 	category: "free" | "freemium" | "paid";
+	/**
+	 * Declared free access for a provider whose catalog prices are non-zero.
+	 * Some free tiers meter usage rather than pricing it at zero (verified
+	 * live: Groq answers 200 on a free key while `/models` lists real prices),
+	 * so without an explicit entitlement the fail-closed filter would exclude
+	 * every model and the account would contribute nothing.
+	 */
+	freeEntitlement?: FreeEntitlement | undefined;
 }
 
 /**
@@ -34,7 +44,15 @@ export interface ProviderSeed {
  */
 export const PROVIDER_SEEDS: ReadonlyArray<ProviderSeed> = [
 	// --- Free / free-tier -----------------------------------------------------
-	{ providerId: "llm7", baseUrl: "https://api.llm7.io/v1", credentialRef: "LLM7_API_KEY", anonymousCatalog: true, anonymousChat: true, anonymousTier: "turbo", category: "free" },
+	// llm7 no longer serves a keyless free tier: verified live 2026-09-29,
+	// its catalog is paid-only (tier "turbo" still exists but every listed
+	// model is priced) and the flagship answers `model_unavailable`. Seeding it
+	// anonymously only spent a catalog fetch per hour on an empty pool.
+	{ providerId: "llm7", baseUrl: "https://api.llm7.io/v1", credentialRef: "LLM7_API_KEY", anonymousCatalog: true, anonymousChat: false, category: "free" },
+	// Verified live 2026-09-29 with a free-tier key: openai/gpt-oss-120b and
+	// openai/gpt-oss-20b answer 200. Its /models lists NON-ZERO prices, so the
+	// free entitlement is what makes them routable under the free-only policy.
+	{ providerId: "groq", baseUrl: "https://api.groq.com/openai/v1", credentialRef: "GROQ_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "free", freeEntitlement: { models: ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "openai/gpt-oss-safeguard-20b", "qwen/qwen3.8-27b"] } },
 	{ providerId: "cline", baseUrl: "https://api.cline.bot/api/v1", credentialRef: "CLINE_API_KEY", anonymousCatalog: true, anonymousChat: false, category: "free" },
 	{ providerId: "fastrouter", baseUrl: "https://api.fastrouter.ai/api/v1", credentialRef: "FASTROUTER_API_KEY", anonymousCatalog: true, anonymousChat: false, category: "free" },
 	{ providerId: "kilo", baseUrl: "https://api.kilocode.ai/api/openrouter/v1", credentialRef: "KILO_API_KEY", anonymousCatalog: true, anonymousChat: false, category: "free" },
