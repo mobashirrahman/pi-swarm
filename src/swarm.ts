@@ -94,6 +94,25 @@ export interface PlanGatherResult {
 	children: PlanChildResult[];
 }
 
+export interface AgentSummary {
+	agentId: string;
+	state: string;
+	parentAgentId: string | null;
+	/** Task preview — enough to tell siblings apart, never the whole prompt. */
+	task: string;
+	createdAt: number;
+	updatedAt: number;
+	/** Answer size once finished, so a caller can spot an empty result. */
+	chars?: number | undefined;
+	failReason?: string | undefined;
+}
+
+/** First line of a task, truncated — an agent list must stay readable. */
+function preview(task: string): string {
+	const firstLine = task.split("\n").find((line) => line.trim().length > 0) ?? task;
+	return firstLine.length > 120 ? `${firstLine.slice(0, 117)}...` : firstLine;
+}
+
 export interface CapacityView {
 	accountId: string;
 	providerId: string;
@@ -349,6 +368,61 @@ export class SwarmService {
 	/** Event stream access for the SSE endpoint and tests. */
 	get eventBus(): EventBus {
 		return this.events;
+	}
+
+	/**
+	 * List agents — live first, then recently finished — so a caller can see
+	 * what it spawned without tracking ids by hand. Scoped to one subtree by
+	 * default: an agent calling this mid-task cares about its OWN children,
+	 * not every other session's agents in the same database.
+	 */
+	listAgents(options: { state?: "live" | "all"; parentAgentId?: string; limit?: number } = {}): AgentSummary[] {
+		const limit = Math.min(500, Math.max(1, options.limit ?? 50));
+		const state = options.state ?? "live";
+		const summaries = new Map<string, AgentSummary>();
+		const terminalStates = new Set(["completed", "failed", "cancelled"]);
+
+		for (const agentId of this.tree.live()) {
+			const agent = this.getAgent(agentId);
+			if (!agent) continue;
+			summaries.set(agentId, {
+				agentId,
+				state: agent.state,
+				parentAgentId: agent.spec.parentAgentId ?? null,
+				task: preview(agent.spec.task),
+				createdAt: agent.createdAt,
+				updatedAt: agent.updatedAt,
+				chars: agent.finalContent?.length,
+			});
+		}
+		if (this.store) {
+			for (const row of this.store.listAgents()) {
+				if (!terminalStates.has(row.state)) continue;
+				summaries.set(row.agentId, {
+					agentId: row.agentId,
+					state: row.state,
+					parentAgentId: row.spec.parentAgentId ?? null,
+					task: preview(row.spec.task),
+					createdAt: row.createdAt,
+					updatedAt: row.updatedAt,
+					...(row.finalContent !== undefined ? { chars: row.finalContent.length } : {}),
+					...(row.failReason !== undefined ? { failReason: row.failReason } : {}),
+				});
+			}
+		}
+
+		const filtered = [...summaries.values()].filter((summary) => {
+			if (state === "live" && terminalStates.has(summary.state)) return false;
+			if (options.parentAgentId !== undefined && summary.parentAgentId !== options.parentAgentId) return false;
+			return true;
+		});
+		// Live before finished, then most-recently-updated first.
+		filtered.sort((a, b) => {
+			const aLive = terminalStates.has(a.state) ? 1 : 0;
+			const bLive = terminalStates.has(b.state) ? 1 : 0;
+			return aLive - bLive || b.updatedAt - a.updatedAt;
+		});
+		return filtered.slice(0, limit);
 	}
 
 	getAgent(agentId: string): (AgentRow & { transcript?: ReadonlyArray<ChatMessage> }) | undefined {

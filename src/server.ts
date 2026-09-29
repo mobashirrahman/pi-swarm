@@ -176,6 +176,21 @@ async function main(): Promise<number> {
 				sendJson(res, 200, await service.doctor({ timeoutMs: Number.isFinite(timeoutMs) ? timeoutMs : undefined }));
 				return;
 			}
+			if (req.method === "GET" && url.pathname === "/v1/agents") {
+				// Collection read: live agents first, then recently finished.
+				const stateRaw = url.searchParams.get("state");
+				const limitRaw = url.searchParams.get("limit");
+				const limit = limitRaw !== null ? Number.parseInt(limitRaw, 10) : Number.NaN;
+				const parentAgentId = url.searchParams.get("parentAgentId");
+				sendJson(res, 200, {
+					agents: service.listAgents({
+						...(stateRaw === "live" || stateRaw === "all" ? { state: stateRaw } : {}),
+						...(parentAgentId !== null ? { parentAgentId } : {}),
+						...(Number.isFinite(limit) ? { limit } : {}),
+					}),
+				});
+				return;
+			}
 			if (req.method === "GET" && url.pathname === "/v1/models") {
 				// The routing view: what decides which backend serves a turn.
 				const limitRaw = url.searchParams.get("limit");

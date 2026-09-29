@@ -211,6 +211,19 @@ const TOOLS: ToolDefinition[] = [
 		},
 	},
 	{
+		name: "swarm_agents",
+		description:
+			"List agents in the swarm: live ones first, then recently finished, with each task's first line and answer size. Use it to find agents you spawned without tracking ids, or to check a plan's children by passing their plan id as parentAgentId.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				state: { type: "string", enum: ["live", "all"], description: "\"live\" (default) omits finished agents; \"all\" includes recent ones." },
+				parentAgentId: { type: "string", description: "Only agents whose parent is this id (pass a plan id to see its subtasks)." },
+				limit: { type: "number", description: "Max rows to return (default 50, cap 500)." },
+			},
+		},
+	},
+	{
 		name: "swarm_doctor",
 		description:
 			"Diagnose every configured provider: which accounts can actually serve a turn, which are dead, and which are out of credit. Sends one tiny request per account (a few seconds). Use this when turns fail or before adding keys; it does not change routing.",
@@ -263,6 +276,7 @@ interface SwarmBackend {
 	cancel(agentId: string): Promise<boolean>;
 	capacity(): Promise<unknown>;
 	doctor(args: Record<string, unknown>): Promise<unknown>;
+	agents(args: Record<string, unknown>): Promise<unknown>;
 	models(args: Record<string, unknown>): Promise<unknown>;
 	reset(args: Record<string, unknown>): Promise<unknown>;
 }
@@ -308,6 +322,10 @@ class EmbeddedBackend implements SwarmBackend {
 	async doctor(args: Record<string, unknown>): Promise<unknown> {
 		const timeoutMs = parseTimeoutMs(args["timeoutMs"], 60_000);
 		return this.service.doctor({ timeoutMs });
+	}
+
+	async agents(args: Record<string, unknown>): Promise<unknown> {
+		return { agents: this.service.listAgents(parseAgentListArgs(args)) };
 	}
 
 	async models(args: Record<string, unknown>): Promise<unknown> {
@@ -395,6 +413,17 @@ class HttpBackend implements SwarmBackend {
 		return await response.json();
 	}
 
+	async agents(args: Record<string, unknown>): Promise<unknown> {
+		const params = new URLSearchParams();
+		if (args["state"] !== undefined) params.set("state", String(args["state"]));
+		if (args["parentAgentId"] !== undefined) params.set("parentAgentId", String(args["parentAgentId"]));
+		if (args["limit"] !== undefined) params.set("limit", String(Number(args["limit"])));
+		const query = params.size > 0 ? `?${params.toString()}` : "";
+		const response = await fetch(`${this.baseUrl}/v1/agents${query}`);
+		if (!response.ok) throw new Error(`agents failed: ${response.status}`);
+		return await response.json();
+	}
+
 	async models(args: Record<string, unknown>): Promise<unknown> {
 		const params = new URLSearchParams();
 		if (args["limit"] !== undefined) params.set("limit", String(Number(args["limit"])));
@@ -446,6 +475,18 @@ export async function createBackend(): Promise<SwarmBackend> {
 
 const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
 
+/** Validate swarm_agents args the same way the HTTP surface validates them. */
+function parseAgentListArgs(args: Record<string, unknown>): { state?: "live" | "all"; parentAgentId?: string; limit?: number } {
+	const parsed: { state?: "live" | "all"; parentAgentId?: string; limit?: number } = {};
+	if (args["state"] === "live" || args["state"] === "all") parsed.state = args["state"];
+	if (typeof args["parentAgentId"] === "string" && args["parentAgentId"].length > 0) parsed.parentAgentId = args["parentAgentId"];
+	if (args["limit"] !== undefined) {
+		const limit = Number(args["limit"]);
+		if (Number.isFinite(limit)) parsed.limit = limit;
+	}
+	return parsed;
+}
+
 async function callTool(backend: SwarmBackend, name: string, args: Record<string, unknown>): Promise<string> {
 	switch (name) {
 		case "swarm_spawn": {
@@ -486,6 +527,9 @@ async function callTool(backend: SwarmBackend, name: string, args: Record<string
 		}
 		case "swarm_doctor": {
 			return JSON.stringify(await backend.doctor(args));
+		}
+		case "swarm_agents": {
+			return JSON.stringify(await backend.agents(parseAgentListArgs(args)));
 		}
 		case "swarm_models": {
 			return JSON.stringify(await backend.models(args));
