@@ -2,6 +2,50 @@
 
 All notable changes to pi-swarm are documented here.
 
+## [1.4.0] - 2026-10-04
+
+Route through a second wire protocol, exit from chosen countries, and stop
+guessing why a gateway said no.
+
+- **Responses driver** (`src/stream-responses.ts`): one turn against an
+  OpenAI Responses-API endpoint (`POST {baseUrl}/responses`), streamed over
+  SSE with named events. It returns the same `TurnOutcome` as the chat
+  driver, so quota, leases, journaling, and transcripts needed no changes.
+  Verified live against OpenCode Go: `grok-4.7`, `grok-4.6`, `gpt-6-luna`,
+  `gpt-5.6-luna`, and Muse-Spark 1.3/1.2 answer `ModelProtocolUnsupported` on
+  `/chat/completions` and work here, text and tool calls both. Capability
+  probes route by protocol too, so tools and vision are verified on the
+  protocol the model actually serves.
+- **OpenCode Go added**, verified live: the $10/mo subscription gateway at
+  `opencode.ai/zen/go/v1`. Two requirements are not optional and are now
+  satisfied: a real client `User-Agent` (a generic library name draws a
+  Cloudflare `error code: 1010`) and a stable `x-opencode-session` per
+  conversation, without which Go returns `400 MissingSessionID`. Session
+  routing is a provider-declared header, not a hardcoded one. MiniMax is
+  excluded client-side because it speaks Anthropic `/messages`, which has no
+  driver yet.
+- **Geo-egress proxies** (`src/egress.ts`, `docs/egress-proxies.md`): every
+  turn picks a random exit from a bring-your-own pool of HTTP/SOCKS5 proxies,
+  filtered by ISO-2 country (`egressCountries`, `egressMode`). Fail-closed:
+  when a pool is configured and no exit matches, the attempt ends
+  `egress_exhausted` rather than silently connecting direct. An exit failure
+  blacklists the exit and never strikes the provider account, and proxy
+  credentials never reach a log — only proxy ids and redacted hosts.
+- **`swarm_egress`**: shows configured exits, countries, and health;
+  `check:true` verifies each with a tiny IP-echo request that spends no
+  provider quota. Also `GET /v1/egress`.
+- **Provider error messages reach the logs.** Both drivers surface the
+  upstream `error.message` instead of `HTTP 4xx`, so reroutes and diagnostics
+  see the real reason (`AuthError`, `FreeTierError`, `MissingSessionID`,
+  `ModelProtocolUnsupported`) rather than a status code.
+- **Zen's free tier stays unreachable, deliberately.** `big-pickle` and the
+  other Zen-only free models answer `FreeTierError — can only be used from
+  within OpenCode`, a server-side gate on client identity that no header
+  change should be working around. `longcat-2.5-preview-free`,
+  `space-bunny-free`, and `mimo-v2.6-flash` on Go are the free models that do
+  route. See `docs/opencode-go-zen-lab-report.md`.
+- `undici` is now a runtime dependency (proxy agents are not bundled).
+
 ## [1.3.0] - 2026-09-29
 
 Measure what the swarm actually delivers, and make its agents discoverable.
