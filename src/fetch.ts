@@ -18,7 +18,7 @@ export function sleep(ms: number): Promise<void> {
  * generic library name, and use it for abuse monitoring — so every chat,
  * catalog, and probe request carries it.
  */
-export const PI_SWARM_USER_AGENT = "pi-swarm/1.4.0";
+export const PI_SWARM_USER_AGENT = "pi-swarm/1.4.1";
 
 /**
  * Extra fetch options pi-swarm threads through: an Undici dispatcher (e.g. a

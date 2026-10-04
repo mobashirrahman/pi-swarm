@@ -1,11 +1,20 @@
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { handleMessage } from "../src/mcp-server.ts";
+import { PI_SWARM_USER_AGENT } from "../src/fetch.ts";
 
 /**
  * The MCP surface is driven through handleMessage with a fake backend, so the
  * protocol contract (methods, shapes, in-band tool errors) is pinned without
  * spawning the real stdio loop.
  */
+
+/** The single source of truth for the version, read from disk. */
+function pkgVersion(): string {
+	const path = fileURLToPath(new URL("../package.json", import.meta.url));
+	return (JSON.parse(readFileSync(path, "utf8")) as { version: string }).version;
+}
 
 interface FakeBackend {
 	spawn(args: Record<string, unknown>): Promise<{ agentId: string; duplicate: boolean }>;
@@ -50,7 +59,17 @@ describe("MCP protocol contract", () => {
 		expect(result.protocolVersion).toBe("2024-11-05");
 		expect(result.capabilities.tools).toBeDefined();
 		expect(result.serverInfo.name).toBe("pi-swarm");
-		expect(result.serverInfo.version).toBe("1.3.0");
+		// Read package.json rather than hardcoding: the handshake version and
+		// the published version drifted apart once already because a literal
+		// in this file was bumped in lockstep with package.json by hand.
+		expect(result.serverInfo.version).toBe(pkgVersion());
+	});
+
+	it("the advertised version matches the outbound User-Agent", async () => {
+		const result = (await handleMessage(fakeBackend() as never, rpc("initialize"))) as {
+			serverInfo: { version: string };
+		};
+		expect(PI_SWARM_USER_AGENT).toBe(`pi-swarm/${result.serverInfo.version}`);
 	});
 
 	it("notifications produce no response", async () => {

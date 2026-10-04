@@ -2,6 +2,17 @@
 
 All notable changes to pi-swarm are documented here.
 
+## [1.4.1] - 2026-10-04
+
+Fix the handshake reporting the wrong version.
+
+- `initialize` advertised `serverInfo.version` from a literal that was bumped
+  by hand in step with `package.json`, so 1.4.0 answered `1.3.0`. Both
+  literals now track the release, and a test reads `package.json` from disk
+  and asserts the advertised version matches it and the outbound
+  `User-Agent` — the same drift in a test literal is what kept 1.4.0's CI
+  green while the server lied.
+
 ## [1.4.0] - 2026-10-04
 
 Route through a second wire protocol, exit from chosen countries, and stop
