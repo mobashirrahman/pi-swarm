@@ -47,7 +47,7 @@
 		"test:run": "vitest run",
 		"lint": "tsc --noEmit",
 		"build": "esbuild src/mcp-server.ts --bundle --platform=node --format=esm --target=es2023 --external:undici --banner:js='#!/usr/bin/env node' --outfile=dist/mcp-server.js && esbuild src/server.ts --bundle --platform=node --format=esm --target=es2023 --external:undici --banner:js='#!/usr/bin/env node' --outfile=dist/server.js && node -e \"const fs=require('node:fs');fs.mkdirSync('dist/data',{recursive:true});fs.copyFileSync('src/data/benchmarks.json','dist/data/benchmarks.json')\" && chmod +x dist/mcp-server.js dist/server.js",
-		"prepack": "npm run build",
+		"prepare": "npm run build",
 		"prepublishOnly": "npm run lint && npm run test:run",
 		"release:check": "npm run lint && npm run test:run && npm run build && npm pack --dry-run",
 		"dev": "tsx src/server.ts",
