@@ -58,6 +58,7 @@
 		"audit": "tsx scripts/audit-providers.ts --chat",
 		"bench": "tsx scripts/bench-scheduler.ts",
 		"mcp:verify": "tsx scripts/verify-mcp-config.ts",
+		"install:harnesses": "tsx scripts/install-harnesses.ts",
 		"probe:credentials": "tsx scripts/probe-credentials.ts --env-file ./secrets.env"
 	},
 	"devDependencies": {

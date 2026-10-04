@@ -10,7 +10,25 @@ generalized from "rescue one session" to "schedule N concurrent agents".
 
 ## Install
 
-Follow these four steps once per machine. Total time: about five minutes.
+**Recommended: one command.** From a checkout of this repo, this builds
+`dist/`, merges your exported provider keys into `secrets.env`, writes the
+`swarm` entry into your OpenCode, Claude Code, and Codex configs, then
+checks each harness with a quota-free handshake:
+
+```bash
+export OPENCODE_API_KEY=... GROQ_API_KEY=...   # shell wins; omit a key to keep the secrets.env value
+npm run install:harnesses
+```
+
+Flags: `-- --dry-run` previews every change, `-- --skip-build` skips
+`npm install` when `dist/` is fresh, `-- --verify` additionally runs the
+full spawn-and-wait check per harness (spends a little quota). Key names
+come from the provider catalog, values are never printed, and the first
+touch of each config keeps a `.bak`. Restart each harness afterwards so it
+picks up the new server process.
+
+Prefer to wire things by hand? Follow the four manual steps below (about
+five minutes).
 
 ### 1. Prerequisites
 
@@ -115,15 +133,19 @@ PI_SWARM_WORKSPACE = "/absolute/path/to/.pi-swarm-workspace"
 }
 ```
 
-Prefer running from source? Clone the repo and substitute
-`npx -y pi-swarm-mcp` with `npx tsx /path/to/pi-swarm/src/mcp-server.ts`
-(run from the repo so `tsx` resolves). Maintainers should use the release
+Prefer running from source? Clone the repo and run
+`npm run install:harnesses` — it points every harness at
+`node /path/to/pi-swarm/dist/mcp-server.js` (an absolute path, so it works
+from any working directory and survives `brew upgrade node`, unlike a
+version-pinned `npx` invocation). Re-run it after pulling: the `prepare`
+hook rebuilds `dist/` on every `npm install`, and the installer re-checks
+each harness. Maintainers should use the release
 check and tagged workflow described in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ### 4. Verify
 
 In any client, confirm the server is registered (e.g. `/mcp` in Claude Code
-or Codex lists `swarm` with 9 tools), then ask it to:
+or Codex lists `swarm` with 12 tools), then ask it to:
 
 1. Call `swarm_capacity` — your keyed accounts should appear with model
    counts. If only anonymous tiers show up, the env file path is wrong or a
