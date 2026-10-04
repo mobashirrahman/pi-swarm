@@ -285,7 +285,7 @@ export class SwarmService {
 								turnIndex: opts.turnIndex,
 								accountId: result.accountId,
 								modelId: result.modelId,
-								sentAt: now,
+								sentAt: Date.now(),
 								status: "committed",
 								latencyMs: result.outcome.latencyMs,
 							});

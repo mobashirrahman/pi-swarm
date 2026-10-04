@@ -85,6 +85,21 @@ describe("cancellation tree", () => {
 		expect(parent.cancelCalls).toBe(0);
 	});
 
+	it("reaps deep live descendants through a terminal middle node", () => {
+		const tree = new CancellationTree();
+		const root = fakeRuntime("root");
+		const mid = fakeRuntime("mid");
+		const leaf = fakeRuntime("leaf");
+		tree.register("root", undefined, root);
+		tree.register("mid", "root", mid);
+		tree.register("leaf", "mid", leaf);
+		tree.unregister("mid"); // intermediate parent completed; leaf still live
+		expect(tree.cancelTree("root")).toEqual(["leaf", "root"]);
+		expect(root.cancelCalls).toBe(1);
+		expect(mid.cancelCalls).toBe(0);
+		expect(leaf.cancelCalls).toBe(1);
+	});
+
 	it("descendants() lists the live subtree only", () => {
 		const tree = new CancellationTree();
 		tree.register("a", undefined, fakeRuntime("a"));

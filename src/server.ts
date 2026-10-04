@@ -27,6 +27,7 @@ const _logger = createLogger("server");
 
 const PORT = Number.parseInt(process.env.PI_SWARM_PORT ?? "7463", 10);
 const DB_PATH = process.env.PI_SWARM_DB ?? ".pi-swarm.db";
+const MAX_REQUEST_BODY_BYTES = Number.parseInt(process.env.PI_SWARM_MAX_REQUEST_BODY_BYTES ?? "1048576", 10);
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
 	const payload = JSON.stringify(body);
@@ -34,10 +35,40 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 	res.end(payload);
 }
 
-async function readBody(req: IncomingMessage): Promise<string> {
+export async function readBody(req: IncomingMessage): Promise<string> {
 	const chunks: Buffer[] = [];
-	for await (const chunk of req) chunks.push(chunk as Buffer);
+	let total = 0;
+	for await (const chunk of req) {
+		const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+		total += buffer.length;
+		if (total > MAX_REQUEST_BODY_BYTES) {
+			throw new HttpError(413, "request body too large");
+		}
+		chunks.push(buffer);
+	}
 	return Buffer.concat(chunks).toString("utf8");
+}
+
+class HttpError extends Error {
+	constructor(readonly status: number, message: string) {
+		super(message);
+		this.name = "HttpError";
+	}
+}
+
+export async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
+	const text = await readBody(req);
+	if (text.trim().length === 0) return {};
+	try {
+		const parsed = JSON.parse(text) as unknown;
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			throw new HttpError(400, "request body must be a JSON object");
+		}
+		return parsed as Record<string, unknown>;
+	} catch (error) {
+		if (error instanceof HttpError) throw error;
+		throw new HttpError(400, "invalid JSON body");
+	}
 }
 
 async function main(): Promise<number> {
@@ -80,13 +111,13 @@ async function main(): Promise<number> {
 		const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
 		try {
 			if (req.method === "POST" && url.pathname === "/v1/agents") {
-				const body = JSON.parse(await readBody(req)) as { spec: Record<string, unknown>; idempotencyKey?: string };
+				const body = await readJsonBody(req) as { spec: Record<string, unknown>; idempotencyKey?: string };
 				const result = service.spawnAgent({ spec: parseSpec(body.spec ?? {}), idempotencyKey: body.idempotencyKey });
 				sendJson(res, result.duplicate ? 200 : 201, result);
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/v1/plans") {
-				const body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+				const body = await readJsonBody(req);
 				try {
 					const result = service.spawnPlan(parsePlanRequest(body));
 					sendJson(res, result.duplicate ? 200 : 201, result);
@@ -164,7 +195,7 @@ async function main(): Promise<number> {
 				return;
 			}
 			if (req.method === "POST" && url.pathname === "/v1/capacity/reset") {
-				const body = JSON.parse(await readBody(req).catch(() => "{}")) as { accountId?: unknown };
+				const body = await readJsonBody(req).catch(() => ({})) as { accountId?: unknown };
 				const accountId = typeof body.accountId === "string" ? body.accountId : undefined;
 				sendJson(res, 200, service.resetCapacity(accountId));
 				return;
@@ -202,6 +233,10 @@ async function main(): Promise<number> {
 			}
 			sendJson(res, 404, { error: "not_found" });
 		} catch (error) {
+			if (error instanceof HttpError) {
+				sendJson(res, error.status, { error: error.message });
+				return;
+			}
 			_logger.error("request_failed", {
 				path: url.pathname,
 				error: error instanceof Error ? error.message : String(error),

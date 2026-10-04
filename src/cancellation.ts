@@ -26,7 +26,6 @@ export class CancellationTree {
 
 	unregister(agentId: string): void {
 		this.runtimes.delete(agentId);
-		this.parents.delete(agentId);
 	}
 
 	/**
@@ -38,9 +37,9 @@ export class CancellationTree {
 		const result: string[] = [];
 		const visit = (parent: string): void => {
 			for (const [child, childParent] of this.parents) {
-				if (childParent !== parent || !this.runtimes.has(child)) continue;
+				if (childParent !== parent) continue;
 				visit(child);
-				result.push(child);
+				if (this.runtimes.has(child)) result.push(child);
 			}
 		};
 		visit(agentId);
