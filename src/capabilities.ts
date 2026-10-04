@@ -1,5 +1,5 @@
 import { classifyFailure } from "./classifier.ts";
-import { fetchWithTimeout } from "./fetch.ts";
+import { fetchWithTimeout, PI_SWARM_USER_AGENT } from "./fetch.ts";
 import { createLogger } from "./logger.ts";
 import { streamTurn, type ToolSpec } from "./stream.ts";
 
@@ -41,6 +41,12 @@ export interface ProbeEndpoint {
 	modelId: string;
 	apiKey?: string | undefined;
 	signal?: AbortSignal | undefined;
+	dispatcher?: unknown | undefined;
+	egress?: { proxyId: string; country?: string | undefined; redacted?: string | undefined } | undefined;
+	sessionIdHeader?: string | undefined;
+	sessionId?: string | undefined;
+	/** Wire protocol of the candidate (drives chat vs responses probes). */
+	protocol?: "chat-completions" | "responses" | undefined;
 }
 
 function unsupported(status: number | undefined, errorMessage: string): boolean | null {
@@ -55,6 +61,26 @@ export function probeSignal(upstream?: AbortSignal | undefined): AbortSignal {
 }
 
 export async function probeToolsSupport(endpoint: ProbeEndpoint): Promise<boolean | null> {
+	if (endpoint.protocol === "responses") {
+		const { streamResponsesTurn } = await import("./stream-responses.ts");
+		const outcome = await streamResponsesTurn({
+			baseUrl: endpoint.baseUrl,
+			modelId: endpoint.modelId,
+			apiKey: endpoint.apiKey,
+			messages: [{ role: "user", content: "Reply with the word ok." }],
+			tools: [PROBE_TOOL],
+			maxTokens: 1,
+			signal: probeSignal(endpoint.signal),
+			...(endpoint.dispatcher !== undefined ? { dispatcher: endpoint.dispatcher } : {}),
+			...(endpoint.egress !== undefined ? { egress: endpoint.egress } : {}),
+			...(endpoint.sessionIdHeader !== undefined && endpoint.sessionId !== undefined
+				? { sessionIdHeader: endpoint.sessionIdHeader, sessionId: endpoint.sessionId }
+				: {}),
+		});
+		if (outcome.ok) return true;
+		if (!outcome.ok && outcome.proxyError) return null;
+		return unsupported(outcome.status, outcome.errorMessage);
+	}
 	const outcome = await streamTurn({
 		baseUrl: endpoint.baseUrl,
 		modelId: endpoint.modelId,
@@ -63,14 +89,49 @@ export async function probeToolsSupport(endpoint: ProbeEndpoint): Promise<boolea
 		tools: [PROBE_TOOL],
 		maxTokens: 1,
 		signal: probeSignal(endpoint.signal),
+		...(endpoint.dispatcher !== undefined ? { dispatcher: endpoint.dispatcher } : {}),
+		...(endpoint.egress !== undefined ? { egress: endpoint.egress } : {}),
+		...(endpoint.sessionIdHeader !== undefined && endpoint.sessionId !== undefined
+			? { sessionIdHeader: endpoint.sessionIdHeader, sessionId: endpoint.sessionId }
+			: {}),
 	});
 	if (outcome.ok) return true;
+	// A dead exit tells us nothing about the model's capabilities.
+	if (!outcome.ok && outcome.proxyError) return null;
 	return unsupported(outcome.status, outcome.errorMessage);
 }
 
 const PROBE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
 export async function probeVisionSupport(endpoint: ProbeEndpoint): Promise<boolean | null> {
+	if (endpoint.protocol === "responses") {
+		const { streamResponsesTurn } = await import("./stream-responses.ts");
+		const outcome = await streamResponsesTurn({
+			baseUrl: endpoint.baseUrl,
+			modelId: endpoint.modelId,
+			apiKey: endpoint.apiKey,
+			rawInput: [
+				{
+					type: "message",
+					role: "user",
+					content: [
+						{ type: "input_text", text: "What is in this image? Reply with one word." },
+						{ type: "input_image", image_url: `data:image/png;base64,${PROBE_PIXEL_PNG}` },
+					],
+				},
+			],
+			messages: [],
+			maxTokens: 1,
+			signal: probeSignal(endpoint.signal),
+			...(endpoint.dispatcher !== undefined ? { dispatcher: endpoint.dispatcher } : {}),
+			...(endpoint.sessionIdHeader !== undefined && endpoint.sessionId !== undefined
+				? { sessionIdHeader: endpoint.sessionIdHeader, sessionId: endpoint.sessionId }
+				: {}),
+		});
+		if (outcome.ok) return true;
+		if (!outcome.ok && outcome.proxyError) return null;
+		return unsupported(outcome.status, outcome.errorMessage);
+	}
 	let response: Response;
 	try {
 		response = await fetchWithTimeout(
@@ -79,7 +140,11 @@ export async function probeVisionSupport(endpoint: ProbeEndpoint): Promise<boole
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
+					"User-Agent": PI_SWARM_USER_AGENT,
 					...(endpoint.apiKey ? { Authorization: `Bearer ${endpoint.apiKey}` } : {}),
+					...(endpoint.sessionIdHeader !== undefined && endpoint.sessionId !== undefined
+						? { [endpoint.sessionIdHeader]: endpoint.sessionId }
+						: {}),
 				},
 				body: JSON.stringify({
 					model: endpoint.modelId,
@@ -95,6 +160,7 @@ export async function probeVisionSupport(endpoint: ProbeEndpoint): Promise<boole
 					max_tokens: 1,
 				}),
 				signal: probeSignal(endpoint.signal),
+				...(endpoint.dispatcher !== undefined ? { dispatcher: endpoint.dispatcher } : {}),
 			},
 			PROBE_TIMEOUT_MS,
 		);

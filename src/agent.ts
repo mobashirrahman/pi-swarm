@@ -43,6 +43,13 @@ export interface AgentSpec {
 	qualityMetric?: QualityMetric;
 	qualityFloor: number | null;
 	allowUnknownQuality: boolean;
+	/**
+	 * Geo-egress country filter for model turns (ISO-2, e.g. ["US","DE"]).
+	 * Undefined = pool default (or all exits). Random exit per turn.
+	 */
+	egressCountries?: readonly string[] | undefined;
+	/** "off" bypasses the egress pool even when configured (direct). */
+	egressMode?: "auto" | "off" | undefined;
 }
 
 export interface AgentEvents {
@@ -95,6 +102,8 @@ export class AgentRuntime {
 					allowUnknownQuality: boolean;
 					maxAttempts: number;
 					signal: AbortSignal;
+					egressCountries?: readonly string[] | undefined;
+					egressDisabled?: boolean | undefined;
 				},
 			) => Promise<{
 				ok: true;
@@ -102,6 +111,7 @@ export class AgentRuntime {
 				accountId: string;
 				modelId: string;
 				reroutedFrom?: { accountId: string; modelId: string; reason: string } | undefined;
+				egress?: { proxyId: string; country?: string | undefined } | undefined;
 			} | { ok: false; reason: string }>;
 		},
 		private readonly toolExecutor: {
@@ -174,6 +184,8 @@ export class AgentRuntime {
 				allowUnknownQuality: this.spec.allowUnknownQuality,
 				maxAttempts: this.spec.maxProviderAttemptsPerTurn,
 				signal: this.abortController.signal,
+				...(this.spec.egressCountries !== undefined ? { egressCountries: this.spec.egressCountries } : {}),
+				...(this.spec.egressMode === "off" ? { egressDisabled: true } : {}),
 			});
 			// Cancellation wins even if a dispatcher resolves successfully after
 			// the upstream abort signal fired.

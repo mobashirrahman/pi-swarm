@@ -102,6 +102,16 @@ const TOOLS: ToolDefinition[] = [
 				allowUnknownQuality: { type: "boolean", description: "Allow unscored models when a qualityFloor is set (default true)." },
 				parentAgentId: { type: "string", description: "Parent agent id; cancelling the parent cancels this agent." },
 				idempotencyKey: { type: "string", description: "Dedupe key — re-spawning with the same key returns the existing agent." },
+				egressCountries: {
+					type: "array",
+					items: { type: "string" },
+					description: "Geo-egress filter (ISO-2, e.g. [\"US\",\"DE\"]). Each turn picks a random exit from these countries. Omit for pool default.",
+				},
+				egressMode: {
+					type: "string",
+					enum: ["auto", "off"],
+					description: "\"auto\" (default) routes turns via a random egress exit when proxies are configured (fail-closed); \"off\" forces a direct connection.",
+				},
 			},
 			required: ["task"],
 		},
@@ -167,6 +177,8 @@ const TOOLS: ToolDefinition[] = [
 							qualityFloor: { type: "number" },
 							allowUnknownQuality: { type: "boolean" },
 							idempotencyKey: { type: "string" },
+							egressCountries: { type: "array", items: { type: "string" } },
+							egressMode: { type: "string", enum: ["auto", "off"] },
 						},
 						required: ["task"],
 					},
@@ -187,6 +199,8 @@ const TOOLS: ToolDefinition[] = [
 						qualityMetric: { type: "string", enum: ["codingIndex", "intelligenceIndex", "agenticIndex"] },
 						qualityFloor: { type: "number" },
 						allowUnknownQuality: { type: "boolean" },
+						egressCountries: { type: "array", items: { type: "string" } },
+						egressMode: { type: "string", enum: ["auto", "off"] },
 					},
 				},
 				idempotencyKey: { type: "string", description: "Dedupe key — re-planning with the same key returns the existing plan." },
@@ -262,6 +276,18 @@ const TOOLS: ToolDefinition[] = [
 			},
 		},
 	},
+	{
+		name: "swarm_egress",
+		description:
+			"Show the geo-egress pool: configured exits, countries, and health (proxy ids + redacted hosts only, never URLs). Pass check:true to verify each exit with a tiny IP-echo request (no provider quota spent). Turns pick a random exit per attempt and fail closed when none matches.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				check: { type: "boolean", description: "Verify each exit (default false — listing only)." },
+				timeoutMs: { type: "number", description: "Per-exit check timeout in ms (default 15000)." },
+			},
+		},
+	},
 ];
 
 // =============================================================================
@@ -279,6 +305,7 @@ interface SwarmBackend {
 	agents(args: Record<string, unknown>): Promise<unknown>;
 	models(args: Record<string, unknown>): Promise<unknown>;
 	reset(args: Record<string, unknown>): Promise<unknown>;
+	egress(args: Record<string, unknown>): Promise<unknown>;
 }
 
 /** In-process swarm (no daemon required). */
@@ -340,6 +367,18 @@ class EmbeddedBackend implements SwarmBackend {
 		const accountId = args["accountId"] !== undefined ? String(args["accountId"]) : undefined;
 		return this.service.resetCapacity(accountId);
 	}
+
+	async egress(args: Record<string, unknown>): Promise<unknown> {
+		if (args["check"] === true) {
+			const timeoutMs = args["timeoutMs"] !== undefined ? Number(args["timeoutMs"]) : undefined;
+			const view = this.service.egress();
+			const checks = await this.service.checkEgress(
+				timeoutMs !== undefined && Number.isFinite(timeoutMs) ? { timeoutMs } : {},
+			);
+			return { ...view, ...checks };
+		}
+		return this.service.egress();
+	}
 }
 
 /** Proxy to a running pi-swarm HTTP server (PI_SWARM_URL). */
@@ -363,6 +402,8 @@ class HttpBackend implements SwarmBackend {
 					qualityFloor: args["qualityFloor"],
 					allowUnknownQuality: args["allowUnknownQuality"],
 					parentAgentId: args["parentAgentId"],
+					egressCountries: args["egressCountries"],
+					egressMode: args["egressMode"],
 				},
 				idempotencyKey: args["idempotencyKey"],
 			}),
@@ -439,6 +480,16 @@ class HttpBackend implements SwarmBackend {
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ accountId: args["accountId"] }),
 		});
+		return await response.json();
+	}
+
+	async egress(args: Record<string, unknown>): Promise<unknown> {
+		const params = new URLSearchParams();
+		if (args["check"] === true) params.set("check", "true");
+		if (args["timeoutMs"] !== undefined) params.set("timeoutMs", String(Number(args["timeoutMs"])));
+		const query = params.size > 0 ? `?${params.toString()}` : "";
+		const response = await fetch(`${this.baseUrl}/v1/egress${query}`);
+		if (!response.ok) throw new Error(`egress failed: ${response.status}`);
 		return await response.json();
 	}
 }
@@ -536,6 +587,9 @@ async function callTool(backend: SwarmBackend, name: string, args: Record<string
 		}
 		case "swarm_reset": {
 			return JSON.stringify(await backend.reset(args));
+		}
+		case "swarm_egress": {
+			return JSON.stringify(await backend.egress(args));
 		}
 		default:
 			throw new Error(`unknown tool: ${name}`);

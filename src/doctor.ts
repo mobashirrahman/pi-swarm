@@ -13,7 +13,9 @@
 
 import { resolveKey, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
 import { createLogger } from "./logger.ts";
+import { PI_SWARM_USER_AGENT } from "./fetch.ts";
 import { streamTurn } from "./stream.ts";
+import { streamResponsesTurn } from "./stream-responses.ts";
 import { wireModelIsChat } from "./catalog.ts";
 
 const _logger = createLogger("doctor");
@@ -80,7 +82,7 @@ async function probeCatalog(
 	const key = resolveKey(account);
 	try {
 		const response = await fetch(`${account.baseUrl.replace(/\/$/, "")}/models`, {
-			headers: { Accept: "application/json", ...(key ? { Authorization: `Bearer ${key}` } : {}) },
+			headers: { Accept: "application/json", "User-Agent": PI_SWARM_USER_AGENT, ...(key ? { Authorization: `Bearer ${key}` } : {}) },
 			signal: signal ?? AbortSignal.timeout(PROBE_TIMEOUT_MS),
 		});
 		if (!response.ok) {
@@ -107,14 +109,23 @@ async function probeChat(
 	modelId: string,
 	signal: AbortSignal | undefined,
 ): Promise<{ ok: boolean; status?: number | undefined; detail?: string | undefined }> {
-	const outcome = await streamTurn({
+	const base = {
 		baseUrl: account.baseUrl,
 		modelId,
 		apiKey: resolveKey(account),
-		messages: [{ role: "user", content: "Reply with ok." }],
+		messages: [{ role: "user" as const, content: "Reply with ok." }],
 		maxTokens: 1,
 		signal: signal ?? AbortSignal.timeout(PROBE_TIMEOUT_MS),
-	});
+		...(account.sessionIdHeader !== undefined
+			? { sessionIdHeader: account.sessionIdHeader, sessionId: `swarm-doctor:${account.accountId}` }
+			: {}),
+	};
+	let outcome = await streamTurn(base);
+	if (!outcome.ok && outcome.errorMessage.includes("ModelProtocolUnsupported")) {
+		// Model lives on the Responses API — try that driver before
+		// concluding the account cannot serve.
+		outcome = await streamResponsesTurn(base);
+	}
 	if (outcome.ok) return { ok: true };
 	return { ok: false, status: outcome.status, detail: safeDetail(outcome.errorMessage) };
 }

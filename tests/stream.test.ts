@@ -66,4 +66,36 @@ describe("stream SSE framing", () => {
 		expect(result.ok).toBe(true);
 		if (result.ok) expect(result.content).toBe("multi 🌊🙂");
 	});
+
+	it("sends the client user agent and the provider session header", async () => {
+		const seen: Record<string, string | undefined> = {};
+		const capturing = createServer((req, res) => {
+			seen["user-agent"] = req.headers["user-agent"];
+			seen["x-opencode-session"] = req.headers["x-opencode-session"] as string | undefined;
+			res.writeHead(200, { "Content-Type": "text/event-stream" });
+			res.end(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`);
+		});
+		const baseUrl = await new Promise<string>((resolve) => {
+			capturing.listen(0, "127.0.0.1", () => {
+				const address = capturing.address();
+				const port = typeof address === "object" && address ? address.port : 0;
+				resolve(`http://127.0.0.1:${port}/v1`);
+			});
+		});
+		try {
+			// Empty content with finish: the outcome shape is irrelevant,
+			// only that the request (and its headers) arrived.
+			await streamTurn({
+				baseUrl,
+				modelId: "mock",
+				messages: [{ role: "user", content: "hi" }],
+				sessionIdHeader: "x-opencode-session",
+				sessionId: "agent-7",
+			});
+			expect(seen["user-agent"]).toMatch(/^pi-swarm\//);
+			expect(seen["x-opencode-session"]).toBe("agent-7");
+		} finally {
+			await new Promise<void>((resolve) => capturing.close(() => resolve()));
+		}
+	});
 });

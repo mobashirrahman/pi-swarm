@@ -200,6 +200,20 @@ async function main(): Promise<number> {
 				sendJson(res, 200, { models: rows });
 				return;
 			}
+			if (req.method === "GET" && url.pathname === "/v1/egress") {
+				// Geo-egress pool view; ?check=true verifies each exit
+				// (tiny IP-echo request, no provider quota spent).
+				if (url.searchParams.get("check") === "true") {
+					const timeoutRaw = url.searchParams.get("timeoutMs");
+					const timeoutMs = timeoutRaw !== null ? Number.parseInt(timeoutRaw, 10) : Number.NaN;
+					const view = service.egress();
+					const checks = await service.checkEgress(Number.isFinite(timeoutMs) ? { timeoutMs } : {});
+					sendJson(res, 200, { ...view, ...checks });
+					return;
+				}
+				sendJson(res, 200, service.egress());
+				return;
+			}
 			sendJson(res, 404, { error: "not_found" });
 		} catch (error) {
 			_logger.error("request_failed", {

@@ -9,7 +9,7 @@
  * for direct header construction.
  */
 
-import { fetchWithRetry } from "./fetch.ts";
+import { fetchWithRetry, PI_SWARM_USER_AGENT } from "./fetch.ts";
 import { createLogger } from "./logger.ts";
 import type { FreeEntitlement, ProviderAccount } from "./types.ts";
 
@@ -49,6 +49,30 @@ export interface AccountRegistryEntry extends ProviderAccount {
 	 */
 	category?: "free" | "freemium" | "paid" | undefined;
 	freeEntitlement?: FreeEntitlement;
+	/**
+	 * Model ids the swarm must never route to on this account — e.g.
+	 * models on a wire protocol with no driver (OpenCode Go's
+	 * Anthropic-compatible /messages models).
+	 */
+	excludeModels?: readonly string[] | undefined;
+	/**
+	 * Per-conversation routing header the provider requires on chat
+	 * requests (e.g. OpenCode Go's `x-opencode-session`). Sent with the
+	 * agent id as its value.
+	 */
+	sessionIdHeader?: string | undefined;
+	/**
+	 * Model ids served on the Responses API rather than chat/completions.
+	 * The dispatcher picks the wire driver per model from this list.
+	 */
+	responseModels?: readonly string[] | undefined;
+}
+
+export function seedProtocol(
+	account: { responseModels?: readonly string[] | undefined },
+	modelId: string,
+): "chat-completions" | "responses" {
+	return account.responseModels?.includes(modelId) === true ? "responses" : "chat-completions";
 }
 
 /** In-memory account registry. Persistence arrives with the store layer. */
@@ -75,15 +99,15 @@ export class AccountRegistry {
 /** Fetch the model catalog for an account. Anonymous when no key resolves. */
 export async function fetchCatalog(
 	account: AccountRegistryEntry,
-	options: { timeoutMs?: number; signal?: AbortSignal } = {},
+	options: { timeoutMs?: number; signal?: AbortSignal; dispatcher?: unknown } = {},
 ): Promise<CatalogFetchResult> {
 	const url = `${account.baseUrl.replace(/\/$/, "")}/models`;
-	const headers: Record<string, string> = { Accept: "application/json" };
+	const headers: Record<string, string> = { Accept: "application/json", "User-Agent": PI_SWARM_USER_AGENT };
 	const key = resolveKey(account);
 	if (key) headers.Authorization = `Bearer ${key}`;
 
 	try {
-		const response = await fetchWithRetry(url, { headers, signal: options.signal }, 2, 500, options.timeoutMs ?? CATALOG_FETCH_TIMEOUT_MS);
+		const response = await fetchWithRetry(url, { headers, signal: options.signal, ...(options.dispatcher !== undefined ? { dispatcher: options.dispatcher } : {}) }, 2, 500, options.timeoutMs ?? CATALOG_FETCH_TIMEOUT_MS);
 		if (!response.ok) {
 			_logger.warn("catalog fetch non-ok", { provider: account.providerId, status: response.status });
 			return { models: [], error: "network" };

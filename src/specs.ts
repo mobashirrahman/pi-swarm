@@ -37,7 +37,26 @@ export function parseSpec(input: Record<string, unknown>): Omit<AgentSpec, "agen
 	if (typeof input["parentAgentId"] === "string") spec.parentAgentId = input["parentAgentId"];
 	if (typeof input["tierHint"] === "string" && TIER_HINTS.has(input["tierHint"])) spec.tierHint = input["tierHint"] as TierHint;
 	if (typeof input["qualityMetric"] === "string" && QUALITY_METRICS.has(input["qualityMetric"])) spec.qualityMetric = input["qualityMetric"] as QualityMetric;
+	const egressCountries = parseEgressCountries(input["egressCountries"]);
+	if (egressCountries !== undefined) spec.egressCountries = egressCountries;
+	if (input["egressMode"] === "off" || input["egressMode"] === "auto") spec.egressMode = input["egressMode"];
 	return spec;
+}
+
+/**
+ * Coerce an ISO-2 country filter: ["US","de"] → ["US","DE"]. Invalid codes
+ * dropped; empty/undefined → undefined (pool default). Capped at 10.
+ */
+export function parseEgressCountries(value: unknown): readonly string[] | undefined {
+	const list = Array.isArray(value) ? value : typeof value === "string" ? value.split(/[,\s]+/) : undefined;
+	if (!list) return undefined;
+	const codes = [...new Set(
+		list
+			.filter((entry): entry is string => typeof entry === "string")
+			.map((entry) => entry.trim().toUpperCase())
+			.filter((entry) => /^[A-Z]{2}$/.test(entry)),
+	)].slice(0, 10);
+	return codes.length > 0 ? codes : undefined;
 }
 
 /**
@@ -72,6 +91,9 @@ function parsePlanOverrides(input: Record<string, unknown>): Omit<PlanSubtask, "
 	if (typeof input["qualityMetric"] === "string" && QUALITY_METRICS.has(input["qualityMetric"])) {
 		overrides["qualityMetric"] = input["qualityMetric"];
 	}
+	const egressCountries = parseEgressCountries(input["egressCountries"]);
+	if (egressCountries !== undefined) overrides["egressCountries"] = egressCountries;
+	if (input["egressMode"] === "off" || input["egressMode"] === "auto") overrides["egressMode"] = input["egressMode"];
 	return overrides as Omit<PlanSubtask, "task" | "idempotencyKey">;
 }
 

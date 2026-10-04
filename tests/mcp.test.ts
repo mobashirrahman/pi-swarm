@@ -66,7 +66,7 @@ describe("MCP protocol contract", () => {
 			tools: Array<{ name: string; description: string; inputSchema: { type: string; required?: string[] } }>;
 		};
 		const names = result.tools.map((tool) => tool.name);
-		expect(names).toEqual(["swarm_spawn", "swarm_wait", "swarm_status", "swarm_cancel", "swarm_plan", "swarm_gather", "swarm_agents", "swarm_doctor", "swarm_capacity", "swarm_models", "swarm_reset"]);
+		expect(names).toEqual(["swarm_spawn", "swarm_wait", "swarm_status", "swarm_cancel", "swarm_plan", "swarm_gather", "swarm_agents", "swarm_doctor", "swarm_capacity", "swarm_models", "swarm_reset", "swarm_egress"]);
 		for (const tool of result.tools) {
 			expect(tool.description.length).toBeGreaterThan(10);
 			expect(tool.inputSchema.type).toBe("object");

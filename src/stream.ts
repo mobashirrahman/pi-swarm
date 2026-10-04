@@ -7,7 +7,7 @@
  * Returns status + usage + quota headers so the scheduler can reconcile.
  */
 
-import { fetchWithTimeout } from "./fetch.ts";
+import { fetchWithTimeout, PI_SWARM_USER_AGENT } from "./fetch.ts";
 import { createLogger } from "./logger.ts";
 import { extractQuotaHeaders, type HeaderParseResult } from "./quota-headers.ts";
 
@@ -34,6 +34,24 @@ export interface TurnRequest {
 	tools?: ReadonlyArray<ToolSpec> | undefined;
 	maxTokens?: number | undefined;
 	signal?: AbortSignal | undefined;
+	/**
+	 * Undici dispatcher for the request (e.g. a ProxyAgent for one egress
+	 * exit). Undefined = direct connection.
+	 */
+	dispatcher?: unknown | undefined;
+	/**
+	 * Egress attribution for logs/events. Redacted host + country only —
+	 * never the proxy URL (it holds credentials).
+	 */
+	egress?: { proxyId: string; country?: string | undefined; redacted?: string | undefined } | undefined;
+	/**
+	 * Provider routing header (e.g. OpenCode Go's `x-opencode-session`):
+	 * sent with `sessionId` as its value. Gateways use it to route and
+	 * cache per conversation — Go rejects chat without it.
+	 */
+	sessionIdHeader?: string | undefined;
+	/** Stable per-conversation id for `sessionIdHeader` (the agent id). */
+	sessionId?: string | undefined;
 }
 
 export interface ToolSpec {
@@ -75,24 +93,35 @@ const MAX_PLAUSIBLE_TOKENS_PER_SECOND = 1_000;
 
 export type TurnOutcome =
 	| {
-			ok: true;
-			/** Staged assistant message — commit ONLY after full validation. */
-			message: ChatMessage;
-			content: string;
-			toolCalls: Array<{ id: string; name: string; arguments: string }>;
-			usage: TurnUsage | undefined;
-			quota: HeaderParseResult;
-			latencyMs: number;
-			/** Internal speed measurements for routing. */
-			timing: TurnTiming;
-	  }
+		ok: true;
+		/** Staged assistant message — commit ONLY after full validation. */
+		message: ChatMessage;
+		content: string;
+		toolCalls: Array<{ id: string; name: string; arguments: string }>;
+		usage: TurnUsage | undefined;
+		quota: HeaderParseResult;
+		latencyMs: number;
+		/** Internal speed measurements for routing. */
+		timing: TurnTiming;
+		/** Egress exit that served this turn, for attribution. */
+		egress?: { proxyId: string; country?: string | undefined } | undefined;
+  }
 	| {
-			ok: false;
-			status: number | undefined; // undefined = network-level failure
-			errorMessage: string;
-			quota: HeaderParseResult;
-			latencyMs: number;
-	  };
+		ok: false;
+		status: number | undefined; // undefined = network-level failure
+		errorMessage: string;
+		quota: HeaderParseResult;
+		latencyMs: number;
+		/**
+		 * True when the failure happened on the egress path (proxy
+		 * unreachable, proxy auth, or network failure while a proxy was
+		 * in use). The dispatcher uses this to blacklist the EXIT without
+		 * striking the provider account.
+		 */
+		proxyError?: boolean | undefined;
+		/** Egress exit that served (or failed) this turn, for attribution. */
+		egress?: { proxyId: string; country?: string | undefined } | undefined;
+  };
 
 /** Parse `data: {...}` SSE lines from a response body. */
 async function* sseChunks(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
@@ -162,8 +191,10 @@ export async function streamTurn(request: TurnRequest): Promise<TurnOutcome> {
 	const headers: Record<string, string> = {
 		"Content-Type": "application/json",
 		Accept: "text/event-stream",
+		"User-Agent": PI_SWARM_USER_AGENT,
 	};
 	if (request.apiKey) headers.Authorization = `Bearer ${request.apiKey}`;
+	if (request.sessionIdHeader && request.sessionId) headers[request.sessionIdHeader] = request.sessionId;
 
 	const bodyPayload: Record<string, unknown> = {
 		model: request.modelId,
@@ -184,13 +215,17 @@ export async function streamTurn(request: TurnRequest): Promise<TurnOutcome> {
 			headers,
 			body: JSON.stringify(bodyPayload),
 			signal: request.signal,
+			...(request.dispatcher !== undefined ? { dispatcher: request.dispatcher } : {}),
 		}, 120_000);
 	} catch (error) {
 		const aborted = request.signal?.aborted === true;
 		const latencyMs = Date.now() - startedAt;
 		const emptyQuota: HeaderParseResult = { quotas: [], drift: false };
+		const egress = request.egress !== undefined
+			? { proxyId: request.egress.proxyId, ...(request.egress.country !== undefined ? { country: request.egress.country } : {}) }
+			: undefined;
 		if (aborted) {
-			return { ok: false, status: undefined, errorMessage: "aborted", quota: emptyQuota, latencyMs };
+			return { ok: false, status: undefined, errorMessage: "aborted", quota: emptyQuota, latencyMs, ...(egress ? { egress } : {}) };
 		}
 		return {
 			ok: false,
@@ -198,6 +233,11 @@ export async function streamTurn(request: TurnRequest): Promise<TurnOutcome> {
 			errorMessage: error instanceof Error ? error.message : String(error),
 			quota: emptyQuota,
 			latencyMs,
+			// A network failure on the egress path is the EXIT failing, not
+			// the provider — the dispatcher blacklists the proxy, not the
+			// account. Direct-connection failures keep proxyError unset.
+			...(request.dispatcher !== undefined ? { proxyError: true } : {}),
+			...(egress ? { egress } : {}),
 		};
 	}
 
@@ -208,6 +248,7 @@ export async function streamTurn(request: TurnRequest): Promise<TurnOutcome> {
 		provider: new URL(url).host,
 		model: request.modelId,
 		headerNames,
+		...(request.egress !== undefined ? { egress: request.egress.proxyId, egressCountry: request.egress.country ?? null } : {}),
 	});
 
 	const accountId = new URL(url).host;
@@ -215,12 +256,29 @@ export async function streamTurn(request: TurnRequest): Promise<TurnOutcome> {
 
 	if (!response.ok) {
 		const latencyMs = Date.now() - startedAt;
+		const bodyText = await response.text().catch(() => "");
+		const egress = request.egress !== undefined
+			? { proxyId: request.egress.proxyId, ...(request.egress.country !== undefined ? { country: request.egress.country } : {}) }
+			: undefined;
+		let upstreamMessage = `HTTP ${response.status}`;
+		try {
+			const parsed = JSON.parse(bodyText) as { error?: { message?: unknown } };
+			if (typeof parsed.error?.message === "string" && parsed.error.message.length > 0) {
+				upstreamMessage = parsed.error.message.slice(0, 200);
+			}
+		} catch {
+			// Not JSON — keep the status form.
+		}
 		return {
 			ok: false,
 			status: response.status,
-			errorMessage: `HTTP ${response.status}`,
+			errorMessage: upstreamMessage,
 			quota,
 			latencyMs,
+			// 407 = the EXIT rejected the request (bad proxy credentials).
+			// Never strike the provider for it.
+			...(response.status === 407 ? { proxyError: true } : {}),
+			...(egress ? { egress } : {}),
 		};
 	}
 	if (!response.body) {
@@ -275,12 +333,17 @@ export async function streamTurn(request: TurnRequest): Promise<TurnOutcome> {
 			}
 		}
 	} catch (error) {
+		const egress = request.egress !== undefined
+			? { proxyId: request.egress.proxyId, ...(request.egress.country !== undefined ? { country: request.egress.country } : {}) }
+			: undefined;
 		return {
 			ok: false,
 			status: undefined,
 			errorMessage: error instanceof Error ? error.message : String(error),
 			quota,
 			latencyMs: Date.now() - startedAt,
+			...(request.dispatcher !== undefined ? { proxyError: true } : {}),
+			...(egress ? { egress } : {}),
 		};
 	}
 
@@ -288,7 +351,10 @@ export async function streamTurn(request: TurnRequest): Promise<TurnOutcome> {
 	if (!sawFinish && !request.signal?.aborted) {
 		// Stream ended without a finish_reason — treat as a failed stream.
 		// (pi-free classifier: "stream ended before" = transient.)
-		return { ok: false, status: undefined, errorMessage: "stream ended before finish", quota, latencyMs };
+		const egress = request.egress !== undefined
+			? { proxyId: request.egress.proxyId, ...(request.egress.country !== undefined ? { country: request.egress.country } : {}) }
+			: undefined;
+		return { ok: false, status: undefined, errorMessage: "stream ended before finish", quota, latencyMs, ...(egress ? { egress } : {}) };
 	}
 
 	const toolCalls = [...toolCallMap.values()].filter((tc) => tc.id && tc.name);
@@ -318,5 +384,8 @@ export async function streamTurn(request: TurnRequest): Promise<TurnOutcome> {
 		tokensPerSecond,
 	};
 
-	return { ok: true, message, content, toolCalls, usage, quota, latencyMs, timing };
+	const egress = request.egress !== undefined
+		? { proxyId: request.egress.proxyId, ...(request.egress.country !== undefined ? { country: request.egress.country } : {}) }
+		: undefined;
+	return { ok: true, message, content, toolCalls, usage, quota, latencyMs, timing, ...(egress ? { egress } : {}) };
 }

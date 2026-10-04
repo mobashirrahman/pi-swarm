@@ -36,6 +36,22 @@ export interface ProviderSeed {
 	 * every model and the account would contribute nothing.
 	 */
 	freeEntitlement?: FreeEntitlement | undefined;
+	/**
+	 * Model ids never routed on this provider (different wire protocol than
+	 * chat/completions — the dispatcher only speaks chat/completions).
+	 */
+	excludeModels?: readonly string[] | undefined;
+	/**
+	 * Per-conversation routing header required on chat requests, sent with
+	 * the agent id as its value (e.g. OpenCode Go's `x-opencode-session`).
+	 */
+	sessionIdHeader?: string | undefined;
+	/**
+	 * Model ids served on the Responses API rather than chat/completions
+	 * (OpenCode Go's Grok/GPT-Luna/Muse-Spark). Routed through the
+	 * Responses driver; catalog tier/entitlement rules apply unchanged.
+	 */
+	responseModels?: readonly string[] | undefined;
 }
 
 /**
@@ -98,6 +114,37 @@ export const PROVIDER_SEEDS: ReadonlyArray<ProviderSeed> = [
 	{ providerId: "tiyuvta", baseUrl: "https://api.tiyuvta.ai/v1", credentialRef: "TIYUVTA_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
 	{ providerId: "xkiro", baseUrl: "https://api.xkiro.com/v1", credentialRef: "XKIRO_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
 	{ providerId: "bynara", baseUrl: "https://router.bynara.id/v1", credentialRef: "BYNARA_API_KEY", anonymousCatalog: false, anonymousChat: false, category: "freemium" },
+	// OpenCode Go: $10/mo subscription gateway (open-source models, same API
+	// key as Zen). OpenAI-compatible; subscription covers usage, so models
+	// are routable under the keyed-freemium policy — no per-model
+	// entitlement until the audit says otherwise.
+	// Verified live 2026-10-04: chat REQUIRES `x-opencode-session` (stable id
+	// per conversation) plus a real client User-Agent, and only the
+	// /chat/completions models speak our protocol — the /responses and
+	// /messages models are excluded up front (see opencode.ai/docs/go).
+	{
+		providerId: "opencode-go",
+		baseUrl: "https://opencode.ai/zen/go/v1",
+		credentialRef: "OPENCODE_API_KEY",
+		anonymousCatalog: false,
+		anonymousChat: false,
+		category: "freemium",
+		sessionIdHeader: "x-opencode-session",
+		excludeModels: [
+			// MiniMax models use the Anthropic /messages wire protocol, which
+			// has no driver (see the responses driver for the OpenAI branch).
+			"minimax-m3",
+			"minimax-m2.7",
+		],
+		responseModels: [
+			"grok-4.7",
+			"grok-4.6",
+			"gpt-6-luna",
+			"gpt-5.6-luna",
+			"muse-spark-1.3-contributor",
+			"muse-spark-1.2-contributor",
+		],
+	},
 ];
 
 export function seedById(providerId: string): ProviderSeed | undefined {

@@ -75,6 +75,18 @@ export type TierHint = "fast" | "balanced" | "frontier";
 export type QualityMetric = "codingIndex" | "intelligenceIndex" | "agenticIndex";
 export type FreeEntitlement = { models?: readonly string[]; tiers?: readonly string[]; allModels?: boolean };
 
+/**
+ * Wire protocol a model is served on. The dispatcher only speaks
+ * chat-completions natively; `responses` models (OpenCode Go's Grok/GPT-Luna/
+ * Muse-Spark) go through the Responses driver. Absent = chat-completions.
+ */
+export type ApiProtocol = "chat-completions" | "responses";
+
+/** Resolve a candidate's wire protocol (absent means chat-completions). */
+export function candidateProtocol(candidate: { protocol?: ApiProtocol | undefined }): ApiProtocol {
+	return candidate.protocol ?? "chat-completions";
+}
+
 /** A routable (account, model) pair. */
 export interface Candidate {
 	accountId: string;
@@ -92,6 +104,8 @@ export interface Candidate {
 	contextWindow: number;
 	/** Capabilities this model advertises. */
 	capabilities: ModelCapabilities;
+	/** Wire protocol this model is served on (absent = chat-completions). */
+	protocol?: ApiProtocol | undefined;
 }
 
 export interface ModelCapabilities {

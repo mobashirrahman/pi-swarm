@@ -13,12 +13,32 @@ export function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Client User-Agent for all outbound provider requests. Some gateways
+ * (verified: OpenCode Go) require a real client identity rather than a
+ * generic library name, and use it for abuse monitoring — so every chat,
+ * catalog, and probe request carries it.
+ */
+export const PI_SWARM_USER_AGENT = "pi-swarm/1.3.0";
+
+/**
+ * Extra fetch options pi-swarm threads through: an Undici dispatcher (e.g. a
+ * ProxyAgent for one egress exit). `Omit` drops the lib's own `dispatcher`
+ * typing so any dispatcher implementation fits; it is cast back at the
+ * single global-fetch call site below.
+ */
+export type FetchOptions = Omit<RequestInit, "dispatcher"> & { dispatcher?: unknown };
+
+/**
  * Fetch with timeout using AbortController. An upstream signal aborts the
  * fetch immediately with the upstream reason preserved.
+ *
+ * `dispatcher` is the Undici dispatcher (e.g. a ProxyAgent for an egress
+ * exit). It is passed straight through to global fetch — undefined means
+ * a direct connection.
  */
 export async function fetchWithTimeout(
 	url: string,
-	options: RequestInit,
+	options: FetchOptions,
 	timeoutMs = 30_000,
 ): Promise<Response> {
 	const controller = new AbortController();
@@ -38,7 +58,7 @@ export async function fetchWithTimeout(
 		return await fetch(url, {
 			...options,
 			signal: controller.signal,
-		});
+		} as RequestInit);
 	} finally {
 		clearTimeout(timeoutId);
 		upstreamSignal?.removeEventListener("abort", abortFromUpstream);
@@ -73,7 +93,7 @@ export function computeRetryBackoffMs(
  */
 export async function fetchWithRetry(
 	url: string,
-	options: RequestInit,
+	options: FetchOptions,
 	retries = 3,
 	delayMs = 1000,
 	timeoutMs = 30_000,

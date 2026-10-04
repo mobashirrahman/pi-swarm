@@ -13,6 +13,7 @@ import { AgentRuntime, type AgentSpec, type AgentState } from "./agent.ts";
 import { AccountRegistry, resolveKey, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
 import { CapabilityCache } from "./capabilities.ts";
 import { doctor, type DoctorSweep } from "./doctor.ts";
+import { checkEgressProxy, EgressPool, loadEgressConfigFromEnv } from "./egress.ts";
 import { availableSeeds } from "./providers.ts";
 import { candidateQuality } from "./selector.ts";
 import { createLogger } from "./logger.ts";
@@ -64,6 +65,8 @@ export interface PlanSubtask {
 	maxWallTimeMs?: number;
 	maxProviderAttemptsPerTurn?: number;
 	idempotencyKey?: string | undefined;
+	egressCountries?: readonly string[] | undefined;
+	egressMode?: "auto" | "off" | undefined;
 }
 
 export interface PlanRequest {
@@ -124,6 +127,20 @@ export interface CapacityView {
 	models: number;
 }
 
+export interface EgressView {
+	configured: boolean;
+	proxies: Array<{
+		proxyId: string;
+		country?: string | undefined;
+		protocol: string;
+		redacted: string;
+		blacklisted: boolean;
+		strikes: number;
+	}>;
+	countries: string[];
+	defaultCountries?: string[] | undefined;
+}
+
 const DEFAULT_SPEC: Omit<AgentSpec, "agentId" | "task"> = {
 	maxTurns: 12,
 	maxWallTimeMs: 600_000,
@@ -151,6 +168,8 @@ export class SwarmService {
 	readonly workspace: Workspace | undefined;
 	/** Persisted internal performance benchmark (TTFT, tokens/sec, latency). */
 	readonly telemetry: TelemetryStore | undefined;
+	/** Default egress country filter when a spawn does not request one. */
+	private readonly egressDefaultCountries: readonly string[] | undefined;
 	private agentCounter = 0;
 
 	constructor(options: {
@@ -161,6 +180,9 @@ export class SwarmService {
 		workspace?: Workspace | undefined;
 		/** Cross-process lease store (multi-worker deployments). */
 		leases?: LeaseStore | undefined;
+		/** Geo-egress pool; defaults to PI_SWARM_PROXIES* env when omitted. */
+		egress?: EgressPool | undefined;
+		egressDefaultCountries?: readonly string[] | undefined;
 	} = {}) {
 		this.accounts = new AccountRegistry();
 		if (options.accounts) {
@@ -181,6 +203,9 @@ export class SwarmService {
 					anonymousTier: seed.anonymousTier,
 					category: seed.category,
 					...(seed.freeEntitlement !== undefined ? { freeEntitlement: seed.freeEntitlement } : {}),
+					...(seed.excludeModels !== undefined ? { excludeModels: seed.excludeModels } : {}),
+					...(seed.sessionIdHeader !== undefined ? { sessionIdHeader: seed.sessionIdHeader } : {}),
+					...(seed.responseModels !== undefined ? { responseModels: seed.responseModels } : {}),
 				});
 			}
 		}
@@ -199,7 +224,34 @@ export class SwarmService {
 			// Workspace tools are opt-in: they need a sandbox root.
 			if (this.workspace) registerWorkspaceTools(this.toolExecutor, this.workspace);
 		}
-		this.dispatcher = new Dispatcher({ accounts: this.accounts, leases: options.leases, telemetry: this.telemetry, capabilities: new CapabilityCache(this.store) });
+		// Geo-egress: explicit pool wins; otherwise build one from
+		// PI_SWARM_PROXIES / PI_SWARM_PROXIES_FILE when present. Absent =
+		// direct connections (previous behavior, no fail-closed).
+		let egress = options.egress;
+		let egressDefaultCountries = options.egressDefaultCountries;
+		if (egress === undefined) {
+			const config = loadEgressConfigFromEnv();
+			if (config.proxies.length > 0) {
+				egress = new EgressPool(config.proxies);
+				if (config.problems.length > 0) {
+					_logger.warn("egress_config_problems", { problems: config.problems.length });
+				}
+				_logger.info("egress_ready", {
+					proxies: config.proxies.length,
+					countries: egress.countries(),
+				});
+			}
+			if (egressDefaultCountries === undefined) egressDefaultCountries = config.defaultCountries;
+		}
+		this.egressDefaultCountries = egressDefaultCountries !== undefined ? [...egressDefaultCountries] : undefined;
+		this.dispatcher = new Dispatcher({
+			accounts: this.accounts,
+			leases: options.leases,
+			telemetry: this.telemetry,
+			capabilities: new CapabilityCache(this.store),
+			...(egress !== undefined ? { egress } : {}),
+			...(egressDefaultCountries !== undefined ? { egressDefaultCountries } : {}),
+		});
 		// Logged-out accounts stay out of the pool when their chat needs a
 		// key (pi-free #530): only keyless-usable providers stay enabled
 		// without a credential. Cline/FastRouter list keyless but 401 on chat.
@@ -276,6 +328,9 @@ export class SwarmService {
 							latencyMs: result.outcome.latencyMs,
 							...(result.reroutedFrom
 								? { reroutedFrom: `${result.reroutedFrom.accountId}/${result.reroutedFrom.modelId}`, rerouteReason: result.reroutedFrom.reason }
+								: {}),
+							...(result.egress
+								? { egress: result.egress.proxyId, egressCountry: result.egress.country ?? null }
 								: {}),
 						});
 						if (this.store) {
@@ -615,6 +670,75 @@ export class SwarmService {
 			routable.set(candidate.accountId, list);
 		}
 		return doctor(this.accounts.all(), routable, { timeoutMs: options.timeoutMs });
+	}
+
+	/** Geo-egress pool view (ids + countries + redacted hosts, never URLs). */
+	egress(): EgressView {
+		const pool = this.dispatcher.egressPool;
+		if (!pool) {
+			return {
+				configured: false,
+				proxies: [],
+				countries: [],
+				...(this.egressDefaultCountries !== undefined ? { defaultCountries: [...this.egressDefaultCountries] } : {}),
+			};
+		}
+		return {
+			configured: true,
+			proxies: pool.snapshot().map((entry) => ({
+				proxyId: entry.proxyId,
+				...(entry.country ? { country: entry.country } : {}),
+				protocol: entry.protocol,
+				redacted: entry.redacted,
+				blacklisted: entry.blacklisted,
+				strikes: entry.strikes,
+			})),
+			countries: pool.countries(),
+			...(this.egressDefaultCountries !== undefined ? { defaultCountries: [...this.egressDefaultCountries] } : {}),
+		};
+	}
+
+	/**
+	 * Verify every egress exit without spending provider quota: one tiny
+	 * IP-echo request per proxy. Diagnostic only — routing is unchanged.
+	 */
+	async checkEgress(options: { timeoutMs?: number | undefined } = {}): Promise<{
+		checks: Array<{
+			proxyId: string;
+			country?: string | undefined;
+			redacted: string;
+			ok: boolean;
+			exitIp?: string | undefined;
+			error?: string | undefined;
+			latencyMs: number;
+		}>;
+		usable: number;
+		total: number;
+	}> {
+		const pool = this.dispatcher.egressPool;
+		if (!pool || pool.size === 0) return { checks: [], usable: 0, total: 0 };
+		const timeoutMs = options.timeoutMs ?? 15_000;
+		const deadline = AbortSignal.timeout(Math.min(120_000, Math.max(1_000, timeoutMs * pool.size)));
+		const checks = await Promise.all(
+			pool.snapshot().map(async (entry) => {
+				const proxy = pool.get(entry.proxyId);
+				if (!proxy) {
+					return { proxyId: entry.proxyId, redacted: entry.redacted, ok: false as const, error: "unknown proxy", latencyMs: 0 };
+				}
+				if (deadline.aborted) {
+					return {
+						proxyId: proxy.id,
+						...(proxy.country ? { country: proxy.country } : {}),
+						redacted: entry.redacted,
+						ok: false as const,
+						error: "check budget exceeded",
+						latencyMs: 0,
+					};
+				}
+				return checkEgressProxy(proxy, { timeoutMs });
+			}),
+		);
+		return { checks, usable: checks.filter((check) => check.ok).length, total: checks.length };
 	}
 
 	/** Re-resolve refresh interval from the environment (ms). */

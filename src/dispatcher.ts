@@ -18,7 +18,7 @@ import { createLogger } from "./logger.ts";
 import { QuotaRegistry } from "./quota-registry.ts";
 import { selectTurnCandidate, type SelectorContext, type TurnRequirements } from "./selector.ts";
 import { streamTurn, type ChatMessage, type ToolSpec, type TurnOutcome } from "./stream.ts";
-import { fetchCatalog, resolveKey, wireModelIsChat, wireModelIsFree, type AccountRegistry, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
+import { fetchCatalog, resolveKey, wireModelIsChat, wireModelIsFree, seedProtocol, type AccountRegistry, type AccountRegistryEntry, type WireModel } from "./catalog.ts";
 import { computeRetryBackoffMs, sleep } from "./fetch.ts";
 import { lookupModelScore } from "./benchmarks.ts";
 import type { TelemetryStore } from "./telemetry.ts";
@@ -26,6 +26,9 @@ import type { LeaseStore, TurnLease } from "./leases.ts";
 import type { HeaderQuota } from "./quota-headers.ts";
 import { bucketKey, type Candidate, type QualityMetric, type TierHint } from "./types.ts";
 import { CapabilityCache, probeToolsSupport, probeVisionSupport, MAX_PROBES_PER_TURN, type VerifiedCapabilities } from "./capabilities.ts";
+import { dispatcherFor, EgressExhaustedError, MAX_EGRESS_RETRIES_PER_ATTEMPT, type EgressPool } from "./egress.ts";
+import { candidateProtocol } from "./types.ts";
+import { streamResponsesTurn } from "./stream-responses.ts";
 
 const _logger = createLogger("dispatcher");
 
@@ -77,6 +80,14 @@ export interface DispatcherOptions {
 	telemetry?: TelemetryStore | undefined;
 	/** Probed model capabilities (vision/tools); memory-only without a store. */
 	capabilities?: CapabilityCache | undefined;
+	/**
+	 * Geo-egress pool. When set, model turns pick a random exit per attempt
+	 * (fail-closed: no exit → `egress_exhausted`, never direct). Unset =
+	 * direct connections (previous behavior).
+	 */
+	egress?: import("./egress.ts").EgressPool | undefined;
+	/** Default country filter when a turn does not request one. */
+	egressDefaultCountries?: readonly string[] | undefined;
 }
 
 interface ModelHealth {
@@ -120,6 +131,8 @@ export class Dispatcher {
 	private readonly quotaBackoffBaseMs: number;
 	private readonly telemetry: TelemetryStore | undefined;
 	private readonly capabilities: CapabilityCache;
+	private readonly egress: EgressPool | undefined;
+	private readonly egressDefaultCountries: readonly string[] | undefined;
 	private readonly probeInFlight = new Map<string, Promise<boolean | null>>();
 	/** "accountId/modelId" → health. */
 	private readonly health = new Map<string, ModelHealth>();
@@ -145,6 +158,8 @@ export class Dispatcher {
 		this.quotaBackoffBaseMs = options.quotaBackoffBaseMs ?? 5_000;
 		this.telemetry = options.telemetry;
 		this.capabilities = options.capabilities ?? new CapabilityCache();
+		this.egress = options.egress;
+		this.egressDefaultCountries = options.egressDefaultCountries;
 		for (const account of this.accounts.all()) {
 			const list = this.accountsByProvider.get(account.providerId) ?? [];
 			list.push(account);
@@ -172,14 +187,18 @@ export class Dispatcher {
 		for (const { account, models } of fetched) {
 			// Chat-capable models only (image/video generators share the endpoint).
 			const chatModels = models.filter((model) => wireModelIsChat(model));
+			// Provider-declared exclusions: models on a wire protocol the
+			// dispatcher does not speak (Go's /responses + /messages models).
+			const excluded = new Set(account.excludeModels ?? []);
+			const supported = excluded.size > 0 ? chatModels.filter((model) => !excluded.has(model.id)) : chatModels;
 			// Anonymous accounts: restrict to the keyless-usable tier. The tier
 			// name is per-account (llm7 uses "turbo"; verified live that its
 			// "pro" models 401 without a key even though the catalog lists them).
 			const anonymous = !resolveKey(account);
 			const anonymousTier = account.anonymousTier;
 			const usable = anonymous && anonymousTier !== undefined
-				? chatModels.filter((model) => model.tier === undefined || model.tier === anonymousTier)
-				: chatModels;
+				? supported.filter((model) => model.tier === undefined || model.tier === anonymousTier)
+				: supported;
 			const entitled = (model: WireModel): boolean => {
 				const entitlement = account.freeEntitlement;
 				if (!entitlement) return false;
@@ -204,6 +223,7 @@ export class Dispatcher {
 				const score = lookupModelScore(model.id, model.name);
 				const quality = score?.codingIndex ?? score?.intelligenceIndex;
 				const verified = this.capabilities.get(account.accountId, model.id);
+				const protocol = seedProtocol(account, model.id);
 				candidates.push({
 					accountId: account.accountId,
 					providerId: account.providerId,
@@ -221,6 +241,7 @@ export class Dispatcher {
 					// Prefer the measured/benchmarked window when the provider
 					// catalog does not publish one.
 					contextWindow: model.context_length ?? score?.contextWindow ?? 0,
+					...(protocol !== "chat-completions" ? { protocol } : {}),
 				});
 			}
 		}
@@ -240,6 +261,24 @@ export class Dispatcher {
 	/** The routable candidate set (scored), for the routing view. */
 	candidates(): ReadonlyArray<Candidate> {
 		return this.getCandidates();
+	}
+
+	/** Geo-egress pool, when configured (undefined = direct connections). */
+	get egressPool(): EgressPool | undefined {
+		return this.egress;
+	}
+
+	/** Clear all egress exit blacklist entries (operator recovery). */
+	resetEgress(): { cleared: number } {
+		if (!this.egress) return { cleared: 0 };
+		let cleared = 0;
+		for (const entry of this.egress.snapshot()) {
+			if (entry.blacklisted) {
+				this.egress.recordSuccess(entry.proxyId);
+				cleared += 1;
+			}
+		}
+		return { cleared };
 	}
 
 	private getCandidates(): Candidate[] {
@@ -334,12 +373,42 @@ export class Dispatcher {
 		requirements: TurnRequirements,
 		signal: AbortSignal,
 		probeBudget: { remaining: number },
+		egressCtx?: { countries?: readonly string[] | undefined; disabled?: boolean | undefined },
 	): Promise<boolean> {
 		const needTools = requirements.capabilities.includes("tools") && candidate.capsProbed?.tools !== true;
 		const needVision = requirements.capabilities.includes("vision") && candidate.capsProbed?.vision !== true;
 		if (!needTools && !needVision) return false;
 		if (probeBudget.remaining <= 0) return false;
-		const endpoint = { baseUrl: account.baseUrl, modelId: candidate.modelId, apiKey: resolveKey(account), signal };
+		// Capability probes are real provider requests: they follow the same
+		// egress path as turns (fail-closed — never direct when exits exist).
+		// When no exit is available the probes are skipped and the main send
+		// path reports `egress_exhausted`.
+		let dispatcher: unknown = undefined;
+		let egressAttr: { proxyId: string; country?: string | undefined; redacted?: string | undefined } | undefined;
+		if (this.egress && !egressCtx?.disabled) {
+			try {
+				const selection = this.egress.require(egressCtx?.countries ?? this.egressDefaultCountries);
+				dispatcher = await dispatcherFor(selection.url);
+				egressAttr = { proxyId: selection.proxyId, ...(selection.country ? { country: selection.country } : {}), redacted: selection.redacted };
+			} catch {
+				return false;
+			}
+		}
+		const endpoint = {
+			baseUrl: account.baseUrl,
+			modelId: candidate.modelId,
+			apiKey: resolveKey(account),
+			signal,
+			...(dispatcher !== undefined ? { dispatcher } : {}),
+			...(egressAttr !== undefined ? { egress: egressAttr } : {}),
+			// Provider routing header (Go's x-opencode-session): stable id
+			// per conversation, exactly what the gateway asks for.
+			...(account.sessionIdHeader !== undefined
+				? { sessionIdHeader: account.sessionIdHeader, sessionId: requirements.agentId }
+				: {}),
+			// Probes follow the candidate's wire protocol (Go responses models).
+			protocol: candidateProtocol(candidate),
+		};
 		const verified: VerifiedCapabilities = {};
 		if (needTools) {
 			const tools = await this.probe(
@@ -529,6 +598,10 @@ export class Dispatcher {
 			allowUnknownQuality: boolean;
 			maxAttempts: number;
 			signal: AbortSignal;
+			/** Country filter for the egress exit (ISO-2, e.g. ["US","DE"]). */
+			egressCountries?: readonly string[] | undefined;
+			/** When true, bypass the egress pool even when configured. */
+			egressDisabled?: boolean | undefined;
 		},
 		tools?: ReadonlyArray<ToolSpec>,
 	): Promise<{
@@ -537,6 +610,7 @@ export class Dispatcher {
 		accountId: string;
 		modelId: string;
 		reroutedFrom?: { accountId: string; modelId: string; reason: string } | undefined;
+		egress?: { proxyId: string; country?: string | undefined } | undefined;
 	} | { ok: false; reason: string }> {
 		const excludeAccounts = new Set<string>();
 		/** "accountId/modelId" pairs excluded this turn (model-scoped reroute). */
@@ -559,6 +633,13 @@ export class Dispatcher {
 		/** Capability probes this turn may still issue (never from the attempt budget). */
 		const probeBudget = { remaining: MAX_PROBES_PER_TURN };
 		let lastFailedRoute: { accountId: string; modelId: string; reason: string } | undefined;
+		// Geo-egress: random exit per attempt, fail-closed. Resolved per
+		// attempt (not once per turn) so every retry re-rolls the country.
+		const egressCountries = opts.egressCountries ?? this.egressDefaultCountries;
+		const egressRequired = this.egress !== undefined && this.egress.configured && opts.egressDisabled !== true;
+		/** Proxy-path failures this turn (bounded; they never strike providers). */
+		let egressFailures = 0;
+		const maxEgressFailures = Math.max(1, MAX_EGRESS_RETRIES_PER_ATTEMPT * Math.max(1, opts.maxAttempts));
 		while (attempt <= opts.maxAttempts + quotaWaits && quotaWaits <= MAX_QUOTA_WAITS) {
 			if (opts.signal.aborted) return { ok: false, reason: "aborted" };
 			const now = Date.now();
@@ -609,9 +690,43 @@ export class Dispatcher {
 			const account = this.accounts.get(candidate.accountId);
 			if (!account) return { ok: false, reason: "account_missing" };
 
-			if (await this.verifyCapabilities(account, candidate, requirements, opts.signal, probeBudget)) {
+			if (await this.verifyCapabilities(account, candidate, requirements, opts.signal, probeBudget, { countries: egressCountries, disabled: opts.egressDisabled })) {
 				excludeModels.add(`${candidate.accountId}/${candidate.modelId}`);
 				continue;
+			}
+
+			// Geo-egress: roll a random exit BEFORE reserving quota, so a dead
+			// pool fails closed without touching provider budgets. Every loop
+			// iteration re-rolls, giving random-per-turn distribution.
+			let egressSelection: import("./egress.ts").EgressSelection | undefined;
+			let egressDispatcher: unknown = undefined;
+			if (egressRequired) {
+				try {
+					egressSelection = this.egress!.require(egressCountries);
+				} catch (error) {
+					const reason = error instanceof EgressExhaustedError ? error.reason : "all_blacklisted";
+					_logger.info("egress_exhausted", {
+						agentId: opts.agentId,
+						turn: opts.turnIndex,
+						reason,
+						countries: egressCountries ?? null,
+					});
+					return { ok: false, reason: "egress_exhausted" };
+				}
+				try {
+					egressDispatcher = await dispatcherFor(egressSelection.url);
+				} catch {
+					this.egress!.recordFailure(egressSelection.proxyId);
+					egressFailures += 1;
+					_logger.info("egress_proxy_failed", {
+						agentId: opts.agentId,
+						turn: opts.turnIndex,
+						proxy: egressSelection.proxyId,
+						country: egressSelection.country ?? null,
+					});
+					if (egressFailures >= maxEgressFailures) return { ok: false, reason: "egress_exhausted" };
+					continue;
+				}
 			}
 
 			const reservation = this.quota.tryReserve(
@@ -662,14 +777,49 @@ export class Dispatcher {
 
 			attempt += 1; // a SENT request consumes the attempt budget
 
-			const outcome = await streamTurn({
+			const outcome = await (
+				candidateProtocol(candidate) === "responses" ? streamResponsesTurn : streamTurn
+			)({
 				baseUrl: account.baseUrl,
 				modelId: candidate.modelId,
 				apiKey: resolveKey(account),
 				messages,
 				tools,
 				signal: opts.signal,
+				...(egressDispatcher !== undefined ? { dispatcher: egressDispatcher } : {}),
+				...(egressSelection !== undefined
+					? { egress: { proxyId: egressSelection.proxyId, ...(egressSelection.country ? { country: egressSelection.country } : {}), redacted: egressSelection.redacted } }
+					: {}),
+				...(account.sessionIdHeader !== undefined
+					? { sessionIdHeader: account.sessionIdHeader, sessionId: opts.agentId }
+					: {}),
 			});
+
+			// Egress-path failure: the EXIT died, the provider never saw the
+			// request. Release (never commit) quota, release the lease,
+			// blacklist the exit, and refund the provider attempt — this must
+			// never strike the account, circuit, or model.
+			if (!outcome.ok && outcome.proxyError && egressSelection) {
+				this.quota.release(reservationId);
+				this.releaseLease(lease);
+				this.egress!.recordFailure(egressSelection.proxyId);
+				egressFailures += 1;
+				attempt -= 1; // refund: the provider attempt was never spent
+				_logger.info("egress_proxy_failed", {
+					agentId: opts.agentId,
+					turn: opts.turnIndex,
+					account: candidate.accountId,
+					model: candidate.modelId,
+					proxy: egressSelection.proxyId,
+					country: egressSelection.country ?? null,
+				});
+				if (egressFailures >= maxEgressFailures) return { ok: false, reason: "egress_exhausted" };
+				await sleep(computeRetryBackoffMs(egressFailures - 1, 500));
+				continue;
+			}
+
+			// The exit delivered (provider answered or rejected): it is healthy.
+			if (egressSelection) this.egress!.recordSuccess(egressSelection.proxyId);
 
 			// Reconcile quota observations from headers (authoritative).
 			this.applyQuotaObservation(candidate.accountId, outcome.quota, outcome.ok ? outcome.usage?.totalTokens : undefined);
@@ -737,7 +887,10 @@ export class Dispatcher {
 				this.recordHealth(candidate, outcome.latencyMs, true, outcome.timing);
 				const from = lastFailedRoute;
 				const reroutedFrom = from && (from.accountId !== candidate.accountId || from.modelId !== candidate.modelId) ? from : undefined;
-				return { ok: true, outcome, accountId: candidate.accountId, modelId: candidate.modelId, ...(reroutedFrom ? { reroutedFrom } : {}) };
+				const egress = egressSelection !== undefined
+					? { proxyId: egressSelection.proxyId, ...(egressSelection.country ? { country: egressSelection.country } : {}) }
+					: undefined;
+				return { ok: true, outcome, accountId: candidate.accountId, modelId: candidate.modelId, ...(reroutedFrom ? { reroutedFrom } : {}), ...(egress ? { egress } : {}) };
 			}
 
 			// --- Failure path: charge the sent reservation, classify, decide.

@@ -218,4 +218,14 @@ describe("Dispatcher turn execution", () => {
 		expect(dispatcher.circuit.canAdmit("a:1", now)).toBe(true);
 		expect(dispatcher.blacklist.isBlacklisted("a:1/m1", now)).toBe(false);
 	});
+
+	it("excludes provider-declared models from candidates (wrong wire protocol)", async () => {
+		registry.register({ ...account("g:1", "go"), excludeModels: ["m-gone"] });
+		const dispatcher = new Dispatcher({
+			accounts: registry,
+			fetchModels: async (acc) => models(acc.providerId, ["m-chat", "m-gone"]),
+		});
+		const candidates = await dispatcher.loadCandidates();
+		expect(candidates.map((c) => c.modelId)).toEqual(["m-chat"]);
+	});
 });
