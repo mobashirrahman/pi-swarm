@@ -9,9 +9,10 @@
  * Usage:
  *   npx tsx scripts/verify-mcp-config.ts                 # ~/.omp/agent/mcp.json, server "swarm"
  *   npx tsx scripts/verify-mcp-config.ts <config.json> [serverName]
+ *   npx tsx scripts/verify-mcp-config.ts <config.toml> [serverName]   # Codex
  */
 
-import { spawn } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -21,16 +22,51 @@ interface McpServerEntry {
 	args?: string[];
 	cwd?: string;
 	env?: Record<string, string>;
+	/** OpenCode names this key `environment`; normalize it to `env`. */
+	environment?: Record<string, string>;
+}
+
+/**
+ * Merge every env key a harness might use into one `env` map. OpenCode spells
+ * it `environment`, Claude Code and Codex spell it `env`; reading only one
+ * silently spawned the server with no credentials, which surfaced as
+ * `capacity: (none)` and a `no_eligible_candidate` spawn rather than as a
+ * config error.
+ */
+function normalizeEnv(entry: McpServerEntry): McpServerEntry {
+	const { environment, ...rest } = entry;
+	if (!environment) return rest;
+	return { ...rest, env: { ...(rest.env ?? {}), ...environment } };
 }
 
 const configPath = process.argv[2] ?? join(homedir(), ".omp", "agent", "mcp.json");
 const serverName = process.argv[3] ?? "swarm";
 
+/**
+ * Parse a harness config as JSON, or as TOML when the path ends in `.toml`
+ * (Codex). TOML goes through python3's `tomllib` rather than adding a parser
+ * dependency for one file format, and the result is normalized to the same
+ * `mcp_servers` shape JSON configs use.
+ */
+function readConfig(path: string): Record<string, unknown> {
+	if (!path.endsWith(".toml")) {
+		return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+	}
+	const dumped = execFileSync(
+		"python3",
+		["-c", "import json,sys,tomllib;print(json.dumps(tomllib.load(open(sys.argv[1],'rb'))))", path],
+		{ encoding: "utf8" },
+	);
+	const parsed = JSON.parse(dumped) as Record<string, unknown>;
+	const servers = parsed["mcp_servers"];
+	return servers ? { ...parsed, mcpServers: servers } : parsed;
+}
+
 /** Accept both the `mcpServers` shape and OpenCode's `mcp` shapes. */
 function readServerEntry(path: string, name: string): McpServerEntry {
-	const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+	const raw = readConfig(path);
 	const fromMcpServers = (raw["mcpServers"] as Record<string, McpServerEntry> | undefined)?.[name];
-	if (fromMcpServers) return fromMcpServers;
+	if (fromMcpServers) return normalizeEnv(fromMcpServers);
 
 	const mcp = raw["mcp"] as Record<string, unknown> | undefined;
 	if (mcp) {
@@ -41,9 +77,9 @@ function readServerEntry(path: string, name: string): McpServerEntry {
 			// OpenCode packs executable + args into one command array.
 			if (Array.isArray(entry.command)) {
 				const [command, ...args] = entry.command as string[];
-				return { ...entry, command: command ?? "", args: args.length > 0 ? args : (entry.args ?? []) };
+				return normalizeEnv({ ...entry, command: command ?? "", args: args.length > 0 ? args : (entry.args ?? []) });
 			}
-			return entry as McpServerEntry;
+			return normalizeEnv(entry as McpServerEntry);
 		}
 	}
 	throw new Error(`server "${name}" not found in ${path}`);
